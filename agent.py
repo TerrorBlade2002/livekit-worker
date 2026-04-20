@@ -158,7 +158,7 @@ class VTAAgent(Agent):
         """Log the verification outcome to the server. You MUST call this before ending any call.
 
         Args:
-            status: The verification outcome. Must be one of: "verified", "customer_wants_human", "dnc", "wrong_number", "third_party_end", "other"
+            status: The verification outcome. Must be one of: "verified", "wrong_number", "third_party_end", "consumer_busy_end", "dnc", "customer_wants_human", "other"
             summary: Brief one-line description of what happened during the call.
             full_name: The customer's name.
         """
