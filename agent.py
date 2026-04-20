@@ -9,7 +9,15 @@ from pathlib import Path
 import aiohttp
 from dotenv import load_dotenv
 from livekit import agents, rtc
-from livekit.agents import Agent, AgentSession, RunContext, function_tool
+from livekit.agents import (
+    Agent,
+    AgentSession,
+    AudioConfig,
+    BackgroundAudioPlayer,
+    BuiltinAudioClip,
+    RunContext,
+    function_tool,
+)
 from livekit.plugins import openai
 from livekit.plugins.openai.realtime.realtime_model import AudioTranscription
 
@@ -268,7 +276,7 @@ async def entrypoint(ctx: agents.JobContext):
     # through transcribed in-language and tempting the model to reply in-kind.
     session = AgentSession(
         llm=openai.realtime.RealtimeModel(
-            voice="coral",
+            voice="shimmer",
             model="gpt-4o-realtime-preview",
             temperature=0.8,
             modalities=["audio", "text"],
@@ -284,6 +292,31 @@ async def entrypoint(ctx: agents.JobContext):
         room=ctx.room,
         agent=vta_agent,
     )
+
+    # Ambient call-center background audio.
+    #
+    # BackgroundAudioPlayer publishes on a SEPARATE outbound audio track from
+    # the agent's voice, so it never mixes into the Realtime model's output
+    # stream and never re-enters the STT input (the agent only subscribes to
+    # the caller's SIP track, not to its own published tracks). Keep volume
+    # low so it doesn't bleed through phone-codec compression and step on
+    # Emma's voice intelligibility.
+    background_audio = BackgroundAudioPlayer(
+        ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=0.35),
+        thinking_sound=[
+            AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING, volume=0.4, probability=0.7),
+            AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING2, volume=0.4, probability=0.3),
+        ],
+    )
+    await background_audio.start(room=ctx.room, agent_session=session)
+
+    async def _cleanup_background_audio():
+        try:
+            await background_audio.aclose()
+        except Exception as e:
+            logger.error(f"Error closing background audio: {e}")
+
+    ctx.add_shutdown_callback(_cleanup_background_audio)
 
     full_name = customer_info.get("full_name", "the customer")
     await session.generate_reply(
