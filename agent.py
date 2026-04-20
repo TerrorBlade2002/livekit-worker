@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession, RunContext, function_tool
 from livekit.plugins import openai
+from livekit.plugins.openai.realtime.realtime_model import AudioTranscription
 
 load_dotenv()
 
@@ -262,12 +263,20 @@ async def entrypoint(ctx: agents.JobContext):
 
     vta_agent = VTAAgent(phone=phone, customer_info=customer_info)
 
+    # Pin the Realtime input transcriber to English so Whisper biases hard
+    # toward en-US. This prevents Hindi/Spanish/etc. input from coming
+    # through transcribed in-language and tempting the model to reply in-kind.
     session = AgentSession(
         llm=openai.realtime.RealtimeModel(
             voice="coral",
             model="gpt-4o-realtime-preview",
             temperature=0.8,
             modalities=["audio", "text"],
+            input_audio_transcription=AudioTranscription(
+                model="gpt-4o-mini-transcribe",
+                language="en",
+                prompt="Transcribe English only. If the speaker uses non-English words, transcribe them phonetically in English characters.",
+            ),
         ),
     )
 
