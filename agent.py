@@ -9,7 +9,7 @@ from pathlib import Path
 
 import aiohttp
 from dotenv import load_dotenv
-from livekit import agents, api, rtc
+from livekit import agents, rtc
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -169,6 +169,7 @@ class VTAAgent(Agent):
         self._call_started_at = time.monotonic()
         self._call_end_notified = False
         self._ending = False  # prevents double-disconnect
+        self._end_call_task: asyncio.Task | None = None
         # Keep the JobContext so we can forcibly delete the room after the
         # closing line — deleting the room evicts the SIP bridge participant,
         # which sends BYE back to TCN (matching Retell's hangup behavior).
@@ -222,22 +223,81 @@ class VTAAgent(Agent):
         # 1. Log verification to server (Retell-compatible endpoint).
         await log_verification_to_server(self._phone, status, summary, full_name)
 
-        # 2. Kick off the deterministic closing + disconnect in the background so
-        #    this tool-call returns promptly and the model doesn't synthesize its
-        #    own goodbye over ours.
-        asyncio.create_task(self._speak_closing_and_disconnect(context, status))
+        # 2. End the call deterministically from this tool invocation itself so
+        #    every terminal scenario follows the exact same awaited shutdown path.
+        if self._end_call_task is None:
+            self._end_call_task = asyncio.create_task(self._end_call_deterministically(context, status))
+        await asyncio.shield(self._end_call_task)
 
         return json.dumps({
             "success": True,
             "status": status,
-            "message": (
-                "Verification logged. The system will now speak the closing "
-                "message and end the call. Do NOT speak anything else."
-            ),
+            "message": "Verification logged and the call was ended.",
         })
 
-    async def _speak_closing_and_disconnect(self, context: RunContext, status: str) -> None:
-        """Speak a deterministic closing line, wait for playout, notify server, then disconnect."""
+    async def _wait_for_room_disconnect(self, room: rtc.Room, timeout: float = 8.0) -> bool:
+        """Wait until the LiveKit room is fully disconnected."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if room.connection_state == rtc.ConnectionState.CONN_DISCONNECTED:
+                return True
+            await asyncio.sleep(0.1)
+        return room.connection_state == rtc.ConnectionState.CONN_DISCONNECTED
+
+    async def _terminate_room(self, session: AgentSession, room: rtc.Room, status: str) -> None:
+        """Deterministically tear down the room and worker session."""
+        room_name = room.name or ""
+
+        if not self._call_end_notified:
+            duration_ms = max(0, int((time.monotonic() - self._call_started_at) * 1000))
+            await notify_call_ended(
+                phone=self._phone,
+                call_id=room_name,
+                duration_ms=duration_ms,
+                disconnection_reason=f"agent_disconnect_after_log_verification:{status}",
+            )
+            self._call_end_notified = True
+
+        delete_succeeded = False
+        if self._ctx is not None and room_name:
+            for attempt in range(1, 4):
+                try:
+                    await asyncio.wait_for(self._ctx.delete_room(room_name), timeout=10.0)
+                    delete_succeeded = True
+                    logger.info(f"Deleted LiveKit room {room_name} on attempt {attempt} (status={status})")
+                    break
+                except Exception as e:
+                    logger.error(f"delete_room attempt {attempt} failed for {room_name}: {e}")
+                    await asyncio.sleep(0.5 * attempt)
+
+        disconnected = await self._wait_for_room_disconnect(room, timeout=8.0) if delete_succeeded else False
+
+        if not disconnected:
+            try:
+                await asyncio.wait_for(session.aclose(), timeout=5.0)
+                logger.info(f"Agent session closed for room {room_name} (status={status})")
+            except Exception as e:
+                logger.error(f"session.aclose failed for room {room_name}: {e}")
+
+            try:
+                await asyncio.wait_for(room.disconnect(), timeout=5.0)
+                logger.info(f"room.disconnect completed for {room_name} (status={status})")
+            except Exception as e:
+                logger.error(f"room.disconnect failed for room {room_name}: {e}")
+
+            disconnected = await self._wait_for_room_disconnect(room, timeout=5.0)
+
+        if self._ctx is not None:
+            try:
+                self._ctx.shutdown(reason=f"call-ended:{status}")
+            except Exception as e:
+                logger.error(f"ctx.shutdown failed for room {room_name}: {e}")
+
+        if not disconnected:
+            logger.warning(f"Room {room_name} did not reach disconnected state after deterministic end-call flow")
+
+    async def _end_call_deterministically(self, context: RunContext, status: str) -> None:
+        """Speak a deterministic closing line, wait for playout, then force room teardown."""
         try:
             session: AgentSession = context.session
             room = session.room
@@ -261,46 +321,9 @@ class VTAAgent(Agent):
                 # Fallback wait so we don't cut off a partial playout.
                 await asyncio.sleep(5.0)
 
-            # 3. Notify the server that the call ended (Retell-compatible webhook).
-            if not self._call_end_notified:
-                duration_ms = max(0, int((time.monotonic() - self._call_started_at) * 1000))
-                await notify_call_ended(
-                    phone=self._phone,
-                    call_id=room.name or "",
-                    duration_ms=duration_ms,
-                    disconnection_reason=f"agent_disconnect_after_log_verification:{status}",
-                )
-                self._call_end_notified = True
-
-            # 4. HANGUP — match Retell's behavior.
-            #    room.disconnect() alone only disconnects the agent participant;
-            #    the SIP bridge stays in the room until LiveKit's idle timeout,
-            #    so TCN never gets a BYE in a timely fashion. Instead, delete
-            #    the entire room via the server API — that forcibly evicts the
-            #    SIP bridge participant, which sends BYE to TCN, and TCN's
-            #    dialer can then move to the next contact.
-            room_name = room.name or ""
-            if self._ctx is not None and room_name:
-                try:
-                    await self._ctx.api.room.delete_room(
-                        api.DeleteRoomRequest(room=room_name)
-                    )
-                    logger.info(f"Deleted LiveKit room {room_name} (status={status}) — SIP BYE en route to TCN")
-                except Exception as e:
-                    logger.error(f"room.delete_room failed ({e}); falling back to room.disconnect()")
-                    try:
-                        await room.disconnect()
-                    except Exception as e2:
-                        logger.error(f"room.disconnect fallback also failed: {e2}")
-            else:
-                # No ctx available — best we can do is local disconnect.
-                try:
-                    await room.disconnect()
-                    logger.info(f"Agent disconnected from room {room_name} (status={status}) — no ctx for room.delete")
-                except Exception as e:
-                    logger.error(f"room.disconnect failed: {e}")
+            await self._terminate_room(session, room, status)
         except Exception as e:
-            logger.error(f"Error in _speak_closing_and_disconnect: {e}")
+            logger.error(f"Error in _end_call_deterministically: {e}")
 
 
 async def entrypoint(ctx: agents.JobContext):
