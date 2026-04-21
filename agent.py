@@ -271,9 +271,10 @@ async def entrypoint(ctx: agents.JobContext):
 
     vta_agent = VTAAgent(phone=phone, customer_info=customer_info)
 
-    # Pin the Realtime input transcriber to English so Whisper biases hard
-    # toward en-US. This prevents Hindi/Spanish/etc. input from coming
-    # through transcribed in-language and tempting the model to reply in-kind.
+    # Pin input transcription to whisper-1 + English.
+    # IMPORTANT: gpt-4o-realtime-preview only accepts "whisper-1" as the
+    # input_audio_transcription model — other model names cause the Realtime
+    # session update to be rejected by OpenAI, which silently kills audio.
     session = AgentSession(
         llm=openai.realtime.RealtimeModel(
             voice="shimmer",
@@ -281,9 +282,9 @@ async def entrypoint(ctx: agents.JobContext):
             temperature=0.8,
             modalities=["audio", "text"],
             input_audio_transcription=AudioTranscription(
-                model="gpt-4o-mini-transcribe",
+                model="whisper-1",
                 language="en",
-                prompt="Transcribe English only. If the speaker uses non-English words, transcribe them phonetically in English characters.",
+                prompt="English only. Transcribe non-English words phonetically in English characters.",
             ),
         ),
     )
@@ -293,28 +294,31 @@ async def entrypoint(ctx: agents.JobContext):
         agent=vta_agent,
     )
 
-    # Ambient call-center background audio.
-    #
-    # BackgroundAudioPlayer publishes on a SEPARATE outbound audio track from
-    # the agent's voice, so it never mixes into the Realtime model's output
-    # stream and never re-enters the STT input (the agent only subscribes to
-    # the caller's SIP track, not to its own published tracks). Keep volume
-    # low so it doesn't bleed through phone-codec compression and step on
-    # Emma's voice intelligibility.
-    background_audio = BackgroundAudioPlayer(
-        ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=0.35),
-        thinking_sound=[
-            AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING, volume=0.4, probability=0.7),
-            AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING2, volume=0.4, probability=0.3),
-        ],
-    )
-    await background_audio.start(room=ctx.room, agent_session=session)
+    # Ambient call-center background audio — published on a separate outbound
+    # track, never mixed into the Realtime TTS stream or fed back into STT.
+    # Wrapped in try/except so a BackgroundAudioPlayer failure can never abort
+    # the call — Emma will still speak, just without ambience.
+    background_audio = None
+    try:
+        background_audio = BackgroundAudioPlayer(
+            ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=0.35),
+            thinking_sound=[
+                AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING, volume=0.4, probability=0.7),
+                AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING2, volume=0.4, probability=0.3),
+            ],
+        )
+        await background_audio.start(room=ctx.room, agent_session=session)
+        logger.info("BackgroundAudioPlayer started (OFFICE_AMBIENCE)")
+    except Exception as e:
+        logger.error(f"BackgroundAudioPlayer failed to start (call continues without it): {e}")
+        background_audio = None
 
     async def _cleanup_background_audio():
-        try:
-            await background_audio.aclose()
-        except Exception as e:
-            logger.error(f"Error closing background audio: {e}")
+        if background_audio is not None:
+            try:
+                await background_audio.aclose()
+            except Exception as e:
+                logger.error(f"Error closing background audio: {e}")
 
     ctx.add_shutdown_callback(_cleanup_background_audio)
 
