@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
@@ -30,6 +31,33 @@ RAILWAY_SERVER_URL = os.getenv("RAILWAY_SERVER_URL", "https://virtual-transfer-a
 
 CONFIG_DIR = Path(__file__).parent / "config"
 
+# Closing messages are controlled server-side (deterministic) so hangup is
+# reliable and in Emma's voice; the LLM MUST NOT speak its own goodbye.
+CLOSING_MESSAGES = {
+    "verified": (
+        "Thank you. We're calling regarding a personal business matter of yours. "
+        "Please hold for a moment while I transfer you to our representative who can assist you further."
+    ),
+    "customer_wants_human": (
+        "Please hold for a moment while I connect you to an agent to assist you further."
+    ),
+    "wrong_number": (
+        "I apologize for the inconvenience — I'll go ahead and remove this number from our list "
+        "so you won't get any more calls from us. Thank you, goodbye."
+    ),
+    "third_party_end": (
+        "Thank you for your time. Have a nice day!"
+    ),
+    "dnc": (
+        "I apologize for the inconvenience — I'll go ahead and remove your number from our list "
+        "so you won't get any more calls from us. Thank you, goodbye."
+    ),
+    "other": (
+        "I apologize if this call caused any inconvenience. Thank you for your time — "
+        "our representatives may try again later or contact you regarding the matter. Goodbye."
+    ),
+}
+
 
 def load_prompt(filename: str) -> str:
     """Read a prompt template from the config directory.
@@ -48,11 +76,7 @@ def normalize_phone(raw: str) -> str:
 
 
 async def fetch_customer_info(phone: str) -> dict:
-    """Call the Railway server's /retell-webhook to look up customer data.
-
-    Server reads req.body.call_inbound.from_number and returns
-    { call_inbound: { dynamic_variables: { full_name }, metadata: {...} } }.
-    """
+    """Call the Railway server's /retell-webhook to look up customer data."""
     normalized = normalize_phone(phone)
     payload = {"call_inbound": {"from_number": f"+1{normalized}"}}
     try:
@@ -106,7 +130,7 @@ async def notify_call_ended(
 
 
 async def log_verification_to_server(phone: str, status: str, summary: str, full_name: str) -> dict:
-    """Log verification result to Railway server, same as Retell's log_verification function."""
+    """Log verification result to Railway server, same contract as Retell's log_verification function."""
     normalized = normalize_phone(phone)
     payload = {
         "args": {
@@ -134,23 +158,27 @@ async def log_verification_to_server(phone: str, status: str, summary: str, full
 
 
 class VTAAgent(Agent):
-    """Virtual Transfer Agent — replaces Retell's Emma."""
+    """Virtual Transfer Agent — Emma (LiveKit replacement for Retell's Emma)."""
 
     def __init__(self, phone: str, customer_info: dict):
         self._phone = phone
         self._customer_info = customer_info
         self._call_started_at = time.monotonic()
         self._call_end_notified = False
+        self._ending = False  # prevents double-disconnect
+
         full_name = customer_info.get("full_name", "the customer")
         company_name = customer_info.get("company_name", "our company")
         company_address = customer_info.get("company_address", "")
         call_back_number = customer_info.get("call_back_number", "")
+        now_utc = datetime.now(timezone.utc).strftime("%A, %B %d, %Y %H:%M UTC")
 
         instructions = load_prompt("system_prompt.md").format(
             full_name=full_name,
             company_name=company_name,
             company_address=company_address,
             call_back_number=call_back_number,
+            now_utc=now_utc,
         )
 
         super().__init__(instructions=instructions)
@@ -164,41 +192,84 @@ class VTAAgent(Agent):
         summary: str,
         full_name: str,
     ) -> str:
-        """Log the verification outcome to the server. You MUST call this before ending any call.
+        """Log the verification outcome to the server AND end the call.
+
+        You MUST call this exactly once before ending any call. After this function
+        is called, the system will speak the appropriate closing message and then
+        disconnect — DO NOT speak a closing or goodbye yourself.
 
         Args:
-            status: The verification outcome. Must be one of: "verified", "wrong_number", "third_party_end", "consumer_busy_end", "dnc", "customer_wants_human", "other"
+            status: The verification outcome. Must be one of:
+                "verified", "wrong_number", "third_party_end", "dnc",
+                "customer_wants_human", "other"
             summary: Brief one-line description of what happened during the call.
             full_name: The customer's name.
         """
         logger.info(f"log_verification called: phone={self._phone}, status={status}, summary={summary}")
+
+        if self._ending:
+            logger.warning("log_verification called twice — ignoring second invocation")
+            return json.dumps({"success": True, "status": status, "message": "Already ending."})
+        self._ending = True
+
+        # 1. Log verification to server (Retell-compatible endpoint).
         await log_verification_to_server(self._phone, status, summary, full_name)
 
-        asyncio.get_event_loop().call_later(
-            12.0,
-            lambda: asyncio.ensure_future(self._end_sip_call(context)),
-        )
+        # 2. Kick off the deterministic closing + disconnect in the background so
+        #    this tool-call returns promptly and the model doesn't synthesize its
+        #    own goodbye over ours.
+        asyncio.create_task(self._speak_closing_and_disconnect(context, status))
 
-        return json.dumps({"success": True, "status": status, "message": "Verification logged successfully."})
+        return json.dumps({
+            "success": True,
+            "status": status,
+            "message": (
+                "Verification logged. The system will now speak the closing "
+                "message and end the call. Do NOT speak anything else."
+            ),
+        })
 
-    async def _end_sip_call(self, context: RunContext):
-        """Hang up the agent's SIP leg so TCN detects disconnect and proceeds."""
+    async def _speak_closing_and_disconnect(self, context: RunContext, status: str) -> None:
+        """Speak a deterministic closing line, wait for playout, notify server, then disconnect."""
         try:
             session: AgentSession = context.session
             room = session.room
+            closing = CLOSING_MESSAGES.get(status, CLOSING_MESSAGES["other"])
+
+            # Small grace period to let the Realtime model's tool-result echo settle
+            # before we queue our closing utterance.
+            await asyncio.sleep(0.3)
+
+            # session.say() returns a SpeechHandle. Await its playout so we only
+            # disconnect after Emma has actually said the closing line.
+            try:
+                handle = await session.say(closing, allow_interruptions=False)
+                if handle is not None and hasattr(handle, "wait_for_playout"):
+                    await handle.wait_for_playout()
+                else:
+                    # Fallback: length-based estimate (~14 chars/sec TTS).
+                    await asyncio.sleep(max(3.0, len(closing) / 14.0))
+            except Exception as e:
+                logger.error(f"Error during session.say closing: {e}")
+                # Fallback wait so we don't cut off a partial playout.
+                await asyncio.sleep(5.0)
+
+            # 3. Notify the server that the call ended (Retell-compatible webhook).
             if not self._call_end_notified:
                 duration_ms = max(0, int((time.monotonic() - self._call_started_at) * 1000))
                 await notify_call_ended(
                     phone=self._phone,
                     call_id=room.name or "",
                     duration_ms=duration_ms,
-                    disconnection_reason="agent_disconnect_after_log_verification",
+                    disconnection_reason=f"agent_disconnect_after_log_verification:{status}",
                 )
                 self._call_end_notified = True
+
+            # 4. Hang up — drop the agent's SIP leg. TCN detects disconnect and moves on.
             await room.disconnect()
-            logger.info(f"Agent disconnected from room for phone {self._phone}")
+            logger.info(f"Agent disconnected from room for phone {self._phone} (status={status})")
         except Exception as e:
-            logger.error(f"Error ending SIP call: {e}")
+            logger.error(f"Error in _speak_closing_and_disconnect: {e}")
 
 
 async def entrypoint(ctx: agents.JobContext):
