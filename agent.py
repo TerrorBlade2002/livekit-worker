@@ -192,9 +192,11 @@ class VTAAgent(Agent):
         end_call_tool = EndCallTool(
             extra_description=(
                 "Before calling end_call, you must have already called log_verification exactly once "
-                "for the terminal outcome. After calling end_call, do not generate any more text."
+                "for the terminal outcome. end_call must disconnect only the LiveKit agent session so the "
+                "TCN-controlled caller leg can continue when applicable. Do not delete the room or disconnect "
+                "the customer participant. After calling end_call, do not generate any more text."
             ),
-            delete_room=True,
+            delete_room=False,
             end_instructions=self._pending_end_message,
             on_tool_called=self._on_end_call_called,
             on_tool_completed=self._on_end_call_completed,
@@ -216,7 +218,7 @@ class VTAAgent(Agent):
         You MUST call this exactly once before ending any call. After this function
         succeeds, immediately call end_call as the very next action. Do not speak
         a closing or goodbye yourself; end_call will handle the final response and
-        disconnect the room.
+        disconnect only the LiveKit agent session.
 
         Args:
             status: The verification outcome. Must be one of:
@@ -370,9 +372,7 @@ async def entrypoint(ctx: agents.JobContext):
     await session.start(
         room=ctx.room,
         agent=vta_agent,
-        room_options=room_io.RoomOptions(
-            delete_room_on_close=True,
-        ),
+        room_options=room_io.RoomOptions(),
     )
 
     # Ambient call-center background audio — published on a separate outbound
