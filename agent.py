@@ -48,6 +48,9 @@ CLOSING_MESSAGES = {
     "third_party_end": (
         "Thank you for your time. Have a nice day!"
     ),
+    "consumer_busy_end": (
+        "Thank you for your time. Have a nice day!"
+    ),
     "dnc": (
         "I apologize for the inconvenience — I'll go ahead and remove your number from our list "
         "so you won't get any more calls from us. Thank you, goodbye."
@@ -200,8 +203,8 @@ class VTAAgent(Agent):
 
         Args:
             status: The verification outcome. Must be one of:
-                "verified", "wrong_number", "third_party_end", "dnc",
-                "customer_wants_human", "other"
+                "verified", "wrong_number", "third_party_end",
+                "consumer_busy_end", "dnc", "customer_wants_human", "other"
             summary: Brief one-line description of what happened during the call.
             full_name: The customer's name.
         """
