@@ -192,6 +192,68 @@ class VTAAgent(Agent):
         super().__init__(instructions=instructions)
         self._full_name = full_name
 
+    async def _log_and_end_call(
+        self,
+        context: RunContext,
+        status: str,
+        summary: str,
+        full_name: str,
+        *,
+        tool_name: str,
+    ) -> str:
+        """Shared implementation for terminal tools that both log and hang up."""
+        logger.info(f"{tool_name} called: phone={self._phone}, status={status}, summary={summary}")
+
+        if self._ending:
+            logger.warning(f"{tool_name} called twice - ignoring second invocation")
+            return json.dumps({"success": True, "status": status, "message": "Already ending."})
+
+        self._ending = True
+
+        # 1. Log verification to server (Retell-compatible endpoint).
+        await log_verification_to_server(self._phone, status, summary, full_name)
+
+        # 2. End the call deterministically from this tool invocation itself so
+        #    every terminal scenario follows the exact same awaited shutdown path.
+        if self._end_call_task is None:
+            self._end_call_task = asyncio.create_task(self._end_call_deterministically(context, status))
+        await asyncio.shield(self._end_call_task)
+
+        return json.dumps({
+            "success": True,
+            "status": status,
+            "message": "Verification logged and the call was ended.",
+        })
+
+    @function_tool()
+    async def end_call(
+        self,
+        context: RunContext,
+        status: str,
+        summary: str,
+        full_name: str,
+    ) -> str:
+        """Log the terminal call outcome and immediately end the call.
+
+        This is the primary terminal tool. Call it exactly once when the call
+        should end. After you call it, remain silent - the system will play the
+        correct closing line and disconnect the room for you.
+
+        Args:
+            status: The terminal outcome. Must be one of:
+                "verified", "wrong_number", "third_party_end",
+                "consumer_busy_end", "dnc", "customer_wants_human", "other"
+            summary: Brief one-line description of what happened during the call.
+            full_name: The customer's name.
+        """
+        return await self._log_and_end_call(
+            context,
+            status,
+            summary,
+            full_name,
+            tool_name="end_call",
+        )
+
     @function_tool()
     async def log_verification(
         self,
@@ -213,27 +275,14 @@ class VTAAgent(Agent):
             summary: Brief one-line description of what happened during the call.
             full_name: The customer's name.
         """
-        logger.info(f"log_verification called: phone={self._phone}, status={status}, summary={summary}")
-
-        if self._ending:
-            logger.warning("log_verification called twice — ignoring second invocation")
-            return json.dumps({"success": True, "status": status, "message": "Already ending."})
-        self._ending = True
-
-        # 1. Log verification to server (Retell-compatible endpoint).
-        await log_verification_to_server(self._phone, status, summary, full_name)
-
-        # 2. End the call deterministically from this tool invocation itself so
-        #    every terminal scenario follows the exact same awaited shutdown path.
-        if self._end_call_task is None:
-            self._end_call_task = asyncio.create_task(self._end_call_deterministically(context, status))
-        await asyncio.shield(self._end_call_task)
-
-        return json.dumps({
-            "success": True,
-            "status": status,
-            "message": "Verification logged and the call was ended.",
-        })
+        logger.info("log_verification invoked as a compatibility alias; prefer end_call")
+        return await self._log_and_end_call(
+            context,
+            status,
+            summary,
+            full_name,
+            tool_name="log_verification",
+        )
 
     async def _wait_for_room_disconnect(self, room: rtc.Room, timeout: float = 8.0) -> bool:
         """Wait until the LiveKit room is fully disconnected."""
@@ -254,7 +303,7 @@ class VTAAgent(Agent):
                 phone=self._phone,
                 call_id=room_name,
                 duration_ms=duration_ms,
-                disconnection_reason=f"agent_disconnect_after_log_verification:{status}",
+                disconnection_reason=f"agent_disconnect_after_end_call:{status}",
             )
             self._call_end_notified = True
 
