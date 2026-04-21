@@ -18,7 +18,9 @@ from livekit.agents import (
     BuiltinAudioClip,
     RunContext,
     function_tool,
+    room_io,
 )
+from livekit.agents.beta.tools import EndCallTool
 from livekit.plugins import openai
 from livekit.plugins.openai.realtime.realtime_model import AudioTranscription
 
@@ -168,12 +170,10 @@ class VTAAgent(Agent):
         self._customer_info = customer_info
         self._call_started_at = time.monotonic()
         self._call_end_notified = False
-        self._ending = False  # prevents double-disconnect
-        self._end_call_task: asyncio.Task | None = None
-        # Keep the JobContext so we can forcibly delete the room after the
-        # closing line — deleting the room evicts the SIP bridge participant,
-        # which sends BYE back to TCN (matching Retell's hangup behavior).
         self._ctx = ctx
+        self._verification_logged = False
+        self._pending_end_status: str | None = None
+        self._pending_end_message: str = CLOSING_MESSAGES["other"]
 
         full_name = customer_info.get("full_name", "the customer")
         company_name = customer_info.get("company_name", "our company")
@@ -189,70 +189,19 @@ class VTAAgent(Agent):
             now_utc=now_utc,
         )
 
-        super().__init__(instructions=instructions)
-        self._full_name = full_name
-
-    async def _log_and_end_call(
-        self,
-        context: RunContext,
-        status: str,
-        summary: str,
-        full_name: str,
-        *,
-        tool_name: str,
-    ) -> str:
-        """Shared implementation for terminal tools that both log and hang up."""
-        logger.info(f"{tool_name} called: phone={self._phone}, status={status}, summary={summary}")
-
-        if self._ending:
-            logger.warning(f"{tool_name} called twice - ignoring second invocation")
-            return json.dumps({"success": True, "status": status, "message": "Already ending."})
-
-        self._ending = True
-
-        # 1. Log verification to server (Retell-compatible endpoint).
-        await log_verification_to_server(self._phone, status, summary, full_name)
-
-        # 2. End the call deterministically from this tool invocation itself so
-        #    every terminal scenario follows the exact same awaited shutdown path.
-        if self._end_call_task is None:
-            self._end_call_task = asyncio.create_task(self._end_call_deterministically(context, status))
-        await asyncio.shield(self._end_call_task)
-
-        return json.dumps({
-            "success": True,
-            "status": status,
-            "message": "Verification logged and the call was ended.",
-        })
-
-    @function_tool()
-    async def end_call(
-        self,
-        context: RunContext,
-        status: str,
-        summary: str,
-        full_name: str,
-    ) -> str:
-        """Log the terminal call outcome and immediately end the call.
-
-        This is the primary terminal tool. Call it exactly once when the call
-        should end. After you call it, remain silent - the system will play the
-        correct closing line and disconnect the room for you.
-
-        Args:
-            status: The terminal outcome. Must be one of:
-                "verified", "wrong_number", "third_party_end",
-                "consumer_busy_end", "dnc", "customer_wants_human", "other"
-            summary: Brief one-line description of what happened during the call.
-            full_name: The customer's name.
-        """
-        return await self._log_and_end_call(
-            context,
-            status,
-            summary,
-            full_name,
-            tool_name="end_call",
+        end_call_tool = EndCallTool(
+            extra_description=(
+                "Before calling end_call, you must have already called log_verification exactly once "
+                "for the terminal outcome. After calling end_call, do not generate any more text."
+            ),
+            delete_room=True,
+            end_instructions=self._pending_end_message,
+            on_tool_called=self._on_end_call_called,
+            on_tool_completed=self._on_end_call_completed,
         )
+
+        super().__init__(instructions=instructions, tools=[end_call_tool])
+        self._full_name = full_name
 
     @function_tool()
     async def log_verification(
@@ -262,11 +211,12 @@ class VTAAgent(Agent):
         summary: str,
         full_name: str,
     ) -> str:
-        """Log the verification outcome to the server AND end the call.
+        """Log the terminal call outcome before calling end_call.
 
         You MUST call this exactly once before ending any call. After this function
-        is called, the system will speak the appropriate closing message and then
-        disconnect — DO NOT speak a closing or goodbye yourself.
+        succeeds, immediately call end_call as the very next action. Do not speak
+        a closing or goodbye yourself; end_call will handle the final response and
+        disconnect the room.
 
         Args:
             status: The verification outcome. Must be one of:
@@ -275,104 +225,58 @@ class VTAAgent(Agent):
             summary: Brief one-line description of what happened during the call.
             full_name: The customer's name.
         """
-        logger.info("log_verification invoked as a compatibility alias; prefer end_call")
-        return await self._log_and_end_call(
-            context,
-            status,
-            summary,
-            full_name,
-            tool_name="log_verification",
-        )
+        logger.info(f"log_verification called: phone={self._phone}, status={status}, summary={summary}")
 
-    async def _wait_for_room_disconnect(self, room: rtc.Room, timeout: float = 8.0) -> bool:
-        """Wait until the LiveKit room is fully disconnected."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if room.connection_state == rtc.ConnectionState.CONN_DISCONNECTED:
-                return True
-            await asyncio.sleep(0.1)
-        return room.connection_state == rtc.ConnectionState.CONN_DISCONNECTED
+        if self._verification_logged:
+            logger.warning("log_verification called twice - ignoring second invocation")
+            return json.dumps({"success": True, "status": status, "message": "Already logged. Call end_call now."})
 
-    async def _terminate_room(self, session: AgentSession, room: rtc.Room, status: str) -> None:
-        """Deterministically tear down the room and worker session."""
-        room_name = room.name or ""
+        await log_verification_to_server(self._phone, status, summary, full_name)
+        self._verification_logged = True
+        self._pending_end_status = status
+        self._pending_end_message = CLOSING_MESSAGES.get(status, CLOSING_MESSAGES["other"])
+        self._full_name = full_name or self._full_name
 
-        if not self._call_end_notified:
-            duration_ms = max(0, int((time.monotonic() - self._call_started_at) * 1000))
-            await notify_call_ended(
-                phone=self._phone,
-                call_id=room_name,
-                duration_ms=duration_ms,
-                disconnection_reason=f"agent_disconnect_after_end_call:{status}",
-            )
-            self._call_end_notified = True
+        return json.dumps({
+            "success": True,
+            "status": status,
+            "message": "Verification logged. Call end_call now and do not say anything else after that.",
+        })
 
-        delete_succeeded = False
-        if self._ctx is not None and room_name:
-            for attempt in range(1, 4):
-                try:
-                    await asyncio.wait_for(self._ctx.delete_room(room_name), timeout=10.0)
-                    delete_succeeded = True
-                    logger.info(f"Deleted LiveKit room {room_name} on attempt {attempt} (status={status})")
-                    break
-                except Exception as e:
-                    logger.error(f"delete_room attempt {attempt} failed for {room_name}: {e}")
-                    await asyncio.sleep(0.5 * attempt)
+    async def _on_end_call_called(self, event) -> None:
+        """Prepare server-side bookkeeping before the official EndCallTool shuts down the room."""
+        status = self._pending_end_status or "other"
 
-        disconnected = await self._wait_for_room_disconnect(room, timeout=8.0) if delete_succeeded else False
+        if not self._verification_logged:
+            logger.warning("end_call was invoked before log_verification; logging fallback status=other")
+            fallback_summary = "Call ended without prior log_verification."
+            await log_verification_to_server(self._phone, status, fallback_summary, self._full_name)
+            self._verification_logged = True
+            self._pending_end_status = status
+            self._pending_end_message = CLOSING_MESSAGES.get(status, CLOSING_MESSAGES["other"])
 
-        if not disconnected:
-            try:
-                await asyncio.wait_for(session.aclose(), timeout=5.0)
-                logger.info(f"Agent session closed for room {room_name} (status={status})")
-            except Exception as e:
-                logger.error(f"session.aclose failed for room {room_name}: {e}")
+        if self._call_end_notified:
+            return
 
-            try:
-                await asyncio.wait_for(room.disconnect(), timeout=5.0)
-                logger.info(f"room.disconnect completed for {room_name} (status={status})")
-            except Exception as e:
-                logger.error(f"room.disconnect failed for room {room_name}: {e}")
-
-            disconnected = await self._wait_for_room_disconnect(room, timeout=5.0)
-
-        if self._ctx is not None:
-            try:
-                self._ctx.shutdown(reason=f"call-ended:{status}")
-            except Exception as e:
-                logger.error(f"ctx.shutdown failed for room {room_name}: {e}")
-
-        if not disconnected:
-            logger.warning(f"Room {room_name} did not reach disconnected state after deterministic end-call flow")
-
-    async def _end_call_deterministically(self, context: RunContext, status: str) -> None:
-        """Speak a deterministic closing line, wait for playout, then force room teardown."""
+        room_name = ""
         try:
-            session: AgentSession = context.session
-            room = session.room
-            closing = CLOSING_MESSAGES.get(status, CLOSING_MESSAGES["other"])
+            room_name = event.ctx.session.room.name or ""
+        except Exception:
+            if self._ctx is not None:
+                room_name = self._ctx.room.name or ""
 
-            # Small grace period to let the Realtime model's tool-result echo settle
-            # before we queue our closing utterance.
-            await asyncio.sleep(0.3)
+        duration_ms = max(0, int((time.monotonic() - self._call_started_at) * 1000))
+        await notify_call_ended(
+            phone=self._phone,
+            call_id=room_name,
+            duration_ms=duration_ms,
+            disconnection_reason=f"agent_disconnect_after_end_call:{status}",
+        )
+        self._call_end_notified = True
 
-            # session.say() returns a SpeechHandle. Await its playout so we only
-            # disconnect after Emma has actually said the closing line.
-            try:
-                handle = await session.say(closing, allow_interruptions=False)
-                if handle is not None and hasattr(handle, "wait_for_playout"):
-                    await handle.wait_for_playout()
-                else:
-                    # Fallback: length-based estimate (~14 chars/sec TTS).
-                    await asyncio.sleep(max(3.0, len(closing) / 14.0))
-            except Exception as e:
-                logger.error(f"Error during session.say closing: {e}")
-                # Fallback wait so we don't cut off a partial playout.
-                await asyncio.sleep(5.0)
-
-            await self._terminate_room(session, room, status)
-        except Exception as e:
-            logger.error(f"Error in _end_call_deterministically: {e}")
+    async def _on_end_call_completed(self, event) -> None:
+        """Inject the status-specific closing line into LiveKit's official EndCallTool reply."""
+        event.output = self._pending_end_message
 
 
 async def entrypoint(ctx: agents.JobContext):
@@ -466,6 +370,9 @@ async def entrypoint(ctx: agents.JobContext):
     await session.start(
         room=ctx.room,
         agent=vta_agent,
+        room_options=room_io.RoomOptions(
+            delete_room_on_close=True,
+        ),
     )
 
     # Ambient call-center background audio — published on a separate outbound
