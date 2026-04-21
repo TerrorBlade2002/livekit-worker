@@ -9,7 +9,7 @@ from pathlib import Path
 
 import aiohttp
 from dotenv import load_dotenv
-from livekit import agents, rtc
+from livekit import agents, api, rtc
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -163,12 +163,16 @@ async def log_verification_to_server(phone: str, status: str, summary: str, full
 class VTAAgent(Agent):
     """Virtual Transfer Agent — Emma (LiveKit replacement for Retell's Emma)."""
 
-    def __init__(self, phone: str, customer_info: dict):
+    def __init__(self, phone: str, customer_info: dict, ctx: agents.JobContext | None = None):
         self._phone = phone
         self._customer_info = customer_info
         self._call_started_at = time.monotonic()
         self._call_end_notified = False
         self._ending = False  # prevents double-disconnect
+        # Keep the JobContext so we can forcibly delete the room after the
+        # closing line — deleting the room evicts the SIP bridge participant,
+        # which sends BYE back to TCN (matching Retell's hangup behavior).
+        self._ctx = ctx
 
         full_name = customer_info.get("full_name", "the customer")
         company_name = customer_info.get("company_name", "our company")
@@ -268,9 +272,33 @@ class VTAAgent(Agent):
                 )
                 self._call_end_notified = True
 
-            # 4. Hang up — drop the agent's SIP leg. TCN detects disconnect and moves on.
-            await room.disconnect()
-            logger.info(f"Agent disconnected from room for phone {self._phone} (status={status})")
+            # 4. HANGUP — match Retell's behavior.
+            #    room.disconnect() alone only disconnects the agent participant;
+            #    the SIP bridge stays in the room until LiveKit's idle timeout,
+            #    so TCN never gets a BYE in a timely fashion. Instead, delete
+            #    the entire room via the server API — that forcibly evicts the
+            #    SIP bridge participant, which sends BYE to TCN, and TCN's
+            #    dialer can then move to the next contact.
+            room_name = room.name or ""
+            if self._ctx is not None and room_name:
+                try:
+                    await self._ctx.api.room.delete_room(
+                        api.DeleteRoomRequest(room=room_name)
+                    )
+                    logger.info(f"Deleted LiveKit room {room_name} (status={status}) — SIP BYE en route to TCN")
+                except Exception as e:
+                    logger.error(f"room.delete_room failed ({e}); falling back to room.disconnect()")
+                    try:
+                        await room.disconnect()
+                    except Exception as e2:
+                        logger.error(f"room.disconnect fallback also failed: {e2}")
+            else:
+                # No ctx available — best we can do is local disconnect.
+                try:
+                    await room.disconnect()
+                    logger.info(f"Agent disconnected from room {room_name} (status={status}) — no ctx for room.delete")
+                except Exception as e:
+                    logger.error(f"room.disconnect failed: {e}")
         except Exception as e:
             logger.error(f"Error in _speak_closing_and_disconnect: {e}")
 
@@ -343,7 +371,7 @@ async def entrypoint(ctx: agents.JobContext):
         customer_info["full_name"] = "the customer"
         logger.warning(f"No customer info found for phone {phone}")
 
-    vta_agent = VTAAgent(phone=phone, customer_info=customer_info)
+    vta_agent = VTAAgent(phone=phone, customer_info=customer_info, ctx=ctx)
 
     # Pin input transcription to whisper-1 + English.
     # IMPORTANT: gpt-4o-realtime-preview only accepts "whisper-1" as the
