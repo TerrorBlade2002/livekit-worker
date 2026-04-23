@@ -250,19 +250,33 @@ class VTAAgent(Agent):
     # ------------------------------------------------------------------
     # Deterministic end-call sequence.
     #
+    # Mirrors Retell's 3-way architecture:
+    #   - TCN leg A: TCN <-> Customer (stays up on TCN side)
+    #   - TCN leg B: TCN <-> LiveKit SIP (the SIP participant in this room)
+    #   - LiveKit room: { SIP participant, VTA agent }
+    #
     # Invariants this coroutine enforces for EVERY terminal status:
-    #   1. Emma speaks CLOSING_MESSAGES[status] — not whatever the LLM
-    #      might have hallucinated. Server-side fixed text.
-    #   2. We await playout so we never truncate Emma's final sentence.
-    #   3. We notify /retell-call-ended once (Retell-compatible contract).
-    #   4. We DELETE the LiveKit room via the server API. This forcibly
-    #      evicts the SIP bridge participant, which sends SIP BYE back to
-    #      TCN. TCN's outbound-dialer template detects leg B ending and
-    #      advances to its "Data Dip" node, which fires:
+    #   1. Emma speaks CLOSING_MESSAGES[status] verbatim; we await playout
+    #      so the final sentence is never truncated.
+    #   2. We notify /retell-call-ended once (Retell-compatible contract).
+    #   3. We REMOVE ONLY THE SIP PARTICIPANT via RemoveParticipant. This
+    #      sends a clean SIP BYE scoped to leg B back to TCN with
+    #      disconnect_reason=PARTICIPANT_REMOVED. TCN's outbound-dialer
+    #      template sees leg B end normally ("Action OK"), advances to its
+    #      "Data Dip" node, and fires:
     #         GET /verification-status?phone=<dialed_number>
-    #      The server returns HTTP 200 + whisper for verified /
-    #      customer_wants_human (TCN transfers leg A to hunt group) or
-    #      HTTP 409 (TCN disconnects leg A). This matches Retell exactly.
+    #      which returns 200 + whisper for verified / customer_wants_human
+    #      (TCN transfers leg A to the hunt group) or 409 (TCN drops leg A).
+    #      Leg A (TCN <-> Customer) is untouched by LiveKit — TCN owns it.
+    #   4. We do NOT call delete_room. Reasons:
+    #        - delete_room produces disconnect_reason=ROOM_DELETED on the
+    #          BYE, which some templates treat as abnormal termination.
+    #        - With the SIP participant gone, LiveKit auto-closes the
+    #          AgentSession (close_on_disconnect=True by default) and
+    #          auto-reaps the empty room after its grace period.
+    #        - Because our worker is registered with agent_name="vta-emma"
+    #          (explicit-dispatch only), LiveKit will NOT auto-redispatch
+    #          a new agent into the stale room.
     #   5. All failures are caught — hangup must not be blocked by a
     #      bookkeeping error.
     # ------------------------------------------------------------------
@@ -277,7 +291,7 @@ class VTAAgent(Agent):
             # doesn't stomp on the first syllable of our closing line.
             await asyncio.sleep(0.3)
 
-            # Step 1 & 2 — speak closing, wait for playout.
+            # Step 1 — speak closing, wait for playout.
             try:
                 handle = await session.say(closing, allow_interruptions=False)
                 if handle is not None and hasattr(handle, "wait_for_playout"):
@@ -290,7 +304,7 @@ class VTAAgent(Agent):
                 # Don't let TTS failure block hangup. Short safety wait.
                 await asyncio.sleep(1.5)
 
-            # Step 3 — notify the Railway server that the call ended. Idempotent
+            # Step 2 — notify the Railway server that the call ended. Idempotent
             # on our side via _call_end_notified, idempotent on server side via
             # log_verification race-condition handling.
             if not self._call_end_notified:
@@ -306,36 +320,46 @@ class VTAAgent(Agent):
                     logger.error(f"notify_call_ended failed ({status}): {e}")
                 self._call_end_notified = True
 
-            # Step 4 — tear down the room. This is the critical step: deleting
-            # the room evicts the SIP bridge, sending BYE to TCN so TCN's
-            # template can advance to the /verification-status data dip.
-            deleted_ok = False
-            if self._ctx is not None and room_name:
+            # Step 3 — locate the SIP participant (leg B from TCN).
+            sip_identity = ""
+            for p in room.remote_participants.values():
+                if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+                    sip_identity = p.identity or ""
+                    break
+
+            # Step 4 — surgical hangup: remove ONLY the SIP participant.
+            # LiveKit SIP sends a clean BYE to TCN; leg A on TCN is untouched.
+            removed_ok = False
+            if self._ctx is not None and room_name and sip_identity:
                 try:
-                    await self._ctx.api.room.delete_room(
-                        api.DeleteRoomRequest(room=room_name)
+                    await self._ctx.api.room.remove_participant(
+                        api.RoomParticipantIdentity(
+                            room=room_name,
+                            identity=sip_identity,
+                        )
                     )
-                    deleted_ok = True
+                    removed_ok = True
                     logger.info(
                         f"[END_CALL] status={status} phone={self._phone} "
-                        f"room={room_name} — deleted, SIP BYE en route to TCN"
+                        f"room={room_name} sip_identity={sip_identity} "
+                        f"— SIP participant removed, BYE en route to TCN"
                     )
                 except Exception as e:
                     logger.error(
-                        f"[END_CALL] room.delete_room failed for {room_name}: {e} "
-                        f"— falling back to room.disconnect()"
+                        f"[END_CALL] remove_participant failed for "
+                        f"{sip_identity} in {room_name}: {e}"
                     )
 
-            # Step 5 — if delete_room failed (or we had no ctx), at least
-            # disconnect the agent's local participant. Worst case the SIP
-            # bridge is left stranded but LiveKit's idle timeout reaps it.
-            if not deleted_ok:
+            # Step 5 — fallback only if we couldn't identify/remove the SIP
+            # participant. We self-disconnect so the job doesn't hang; the
+            # stranded SIP leg will BYE out on LiveKit's idle timeout.
+            if not removed_ok:
+                logger.warning(
+                    f"[END_CALL] falling back to room.disconnect() "
+                    f"(sip_identity={sip_identity or 'not-found'})"
+                )
                 try:
                     await room.disconnect()
-                    logger.info(
-                        f"[END_CALL] status={status} phone={self._phone} "
-                        f"room={room_name} — fell back to room.disconnect()"
-                    )
                 except Exception as e:
                     logger.error(f"[END_CALL] room.disconnect also failed: {e}")
         except Exception as e:
