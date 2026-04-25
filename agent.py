@@ -163,6 +163,28 @@ def find_primary_sip_participant(
     return sip_participants[0]
 
 
+def find_primary_standard_participant(
+    room: rtc.Room,
+    preferred_identity: str = "",
+) -> rtc.RemoteParticipant | None:
+    """Pick a standard participant for Agent Console and other non-SIP testing."""
+    participants = list(room.remote_participants.values())
+
+    if preferred_identity:
+        for participant in participants:
+            if (
+                participant.identity == preferred_identity
+                and participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD
+            ):
+                return participant
+
+    for participant in participants:
+        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD:
+            return participant
+
+    return None
+
+
 async def fetch_customer_info(phone: str) -> dict:
     """Call the Railway server's /retell-webhook to look up customer data."""
     normalized = normalize_phone(phone)
@@ -490,40 +512,51 @@ async def entrypoint(ctx: agents.JobContext):
 
     phone = ""
     sip_identity = ""
+    linked_identity = ""
     customer_info = {}
 
     logger.info("Waiting for SIP participant...")
 
     def refresh_sip_context() -> None:
-        nonlocal phone, sip_identity
-        participant = find_primary_sip_participant(ctx.room, preferred_identity=sip_identity)
-        if participant is None:
+        nonlocal phone, sip_identity, linked_identity
+        sip_participant = find_primary_sip_participant(ctx.room, preferred_identity=sip_identity)
+        if sip_participant is not None:
+            sip_identity = sip_participant.identity or sip_identity
+            linked_identity = sip_identity or linked_identity
+            extracted_phone = extract_phone_from_participant(sip_participant)
+            if extracted_phone:
+                phone = extracted_phone
+
+            logger.info(
+                "Primary SIP participant: identity=%s callStatus=%s phone=%s metadata=%s",
+                sip_participant.identity,
+                (sip_participant.attributes or {}).get("sip.callStatus", ""),
+                phone,
+                sip_participant.metadata,
+            )
             return
 
-        sip_identity = participant.identity or sip_identity
-        extracted_phone = extract_phone_from_participant(participant)
-        if extracted_phone:
-            phone = extracted_phone
-
-        logger.info(
-            "Primary SIP participant: identity=%s callStatus=%s phone=%s metadata=%s",
-            participant.identity,
-            (participant.attributes or {}).get("sip.callStatus", ""),
-            phone,
-            participant.metadata,
+        standard_participant = find_primary_standard_participant(
+            ctx.room,
+            preferred_identity=linked_identity,
         )
+        if standard_participant is not None:
+            linked_identity = standard_participant.identity or linked_identity
+            logger.info(
+                "Primary standard participant for console/dev: identity=%s metadata=%s",
+                standard_participant.identity,
+                standard_participant.metadata,
+            )
 
     refresh_sip_context()
 
-    if not phone:
+    if not phone and not linked_identity:
         participant_connected = asyncio.Event()
 
         @ctx.room.on("participant_connected")
         def on_participant_connected(participant: rtc.RemoteParticipant):
-            if participant.kind != rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
-                return
             refresh_sip_context()
-            if phone:
+            if phone or linked_identity:
                 participant_connected.set()
 
         try:
@@ -595,13 +628,19 @@ async def entrypoint(ctx: agents.JobContext):
     )
 
     room_options = room_io.RoomOptions(
-        participant_kinds=[rtc.ParticipantKind.PARTICIPANT_KIND_SIP],
+        participant_kinds=[
+            rtc.ParticipantKind.PARTICIPANT_KIND_SIP,
+            rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD,
+        ],
         delete_room_on_close=False,
     )
-    if sip_identity:
+    if linked_identity:
         room_options = room_io.RoomOptions(
-            participant_kinds=[rtc.ParticipantKind.PARTICIPANT_KIND_SIP],
-            participant_identity=sip_identity,
+            participant_kinds=[
+                rtc.ParticipantKind.PARTICIPANT_KIND_SIP,
+                rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD,
+            ],
+            participant_identity=linked_identity,
             delete_room_on_close=False,
         )
 
@@ -609,7 +648,9 @@ async def entrypoint(ctx: agents.JobContext):
 
     linked_participant = getattr(getattr(session, "room_io", None), "linked_participant", None)
     if linked_participant is not None and linked_participant.identity:
-        vta_agent._sip_identity = linked_participant.identity
+        linked_identity = linked_participant.identity
+        if linked_participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+            vta_agent._sip_identity = linked_participant.identity
         if not phone:
             phone = extract_phone_from_participant(linked_participant)
             vta_agent._phone = phone
