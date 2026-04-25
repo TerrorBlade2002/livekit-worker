@@ -8,9 +8,29 @@ Do not merge them into one deploy unless you intentionally want a combined archi
 ## What this worker does
 - Connects to LiveKit Cloud as agent `vta-emma`
 - Handles inbound SIP-dispatched calls
+- Runs a **cascaded STT → LLM → TTS pipeline** (see below)
 - Fetches customer data from the existing Railway webhook server
 - Logs dispositions back to the same Railway server
 - Sends `call_ended` notifications before disconnecting
+
+## Pipeline (cascaded — switched from OpenAI Realtime)
+
+| Stage | Provider | Default model                  | Override env             |
+| ----- | -------- | ------------------------------ | ------------------------ |
+| STT   | OpenAI   | `whisper-1` (English-pinned)   | `OPENAI_STT_MODEL`       |
+| LLM   | OpenAI   | `gpt-4o-mini`                  | `OPENAI_LLM_MODEL`, `OPENAI_LLM_TEMPERATURE` |
+| TTS   | Google   | `gemini-2.5-flash-preview-tts` | `GEMINI_TTS_MODEL`, `GEMINI_VOICE` |
+| VAD   | Silero   | (loaded locally)               | —                        |
+
+**Why cascaded:** the Realtime model paraphrased compliance-sensitive closing
+lines (DNC, callback number, etc.) even when instructed not to. The Gemini TTS
+plugin's default instruction is *"Say the text with a proper tone, don't omit
+or add any words"* — so `session.say(closing)` is now reliably verbatim.
+
+**End-call detail:** in `_end_call_sequence` we now call `session.interrupt()`
+right before `session.say(closing)`. Cascaded LLMs tend to emit a short
+acknowledgment after a tool call ("Okay, thank you...") which would otherwise
+be TTS'd in front of our deterministic closing — the interrupt cancels it.
 
 ## Existing Railway server used by this worker
 This worker is designed to call your already-running webhook server for:
@@ -27,11 +47,21 @@ This worker is designed to call your already-running webhook server for:
 
 ## Environment variables
 Copy [.env.example](.env.example) to `.env` and set:
+
+Required:
 - `LIVEKIT_URL`
 - `LIVEKIT_API_KEY`
 - `LIVEKIT_API_SECRET`
-- `OPENAI_API_KEY`
+- `OPENAI_API_KEY` — used for both STT (Whisper) and LLM
+- `GEMINI_API_KEY` — used for Gemini TTS (passed explicitly into the plugin; `GOOGLE_API_KEY` also accepted as a fallback)
 - `RAILWAY_SERVER_URL`
+
+Optional knobs (sensible defaults — only set to override):
+- `OPENAI_LLM_MODEL` (default `gpt-4o-mini`)
+- `OPENAI_LLM_TEMPERATURE` (default `0.7`)
+- `OPENAI_STT_MODEL` (default `whisper-1`)
+- `GEMINI_TTS_MODEL` (default `gemini-2.5-flash-preview-tts`)
+- `GEMINI_VOICE` (default `Aoede` — also good: `Leda`, `Kore`, `Vindemiatrix`, `Achird`)
 
 ## Local run
 Install dependencies and run the worker:

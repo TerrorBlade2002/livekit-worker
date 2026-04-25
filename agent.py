@@ -19,8 +19,8 @@ from livekit.agents import (
     RunContext,
     function_tool,
 )
-from livekit.plugins import openai
-from livekit.plugins.openai.realtime.realtime_model import AudioTranscription
+from livekit.plugins import openai, silero
+from livekit.plugins.google.beta import GeminiTTS
 
 load_dotenv()
 
@@ -28,6 +28,18 @@ logger = logging.getLogger("vta-agent")
 logger.setLevel(logging.INFO)
 
 RAILWAY_SERVER_URL = os.getenv("RAILWAY_SERVER_URL", "https://virtual-transfer-agent-production.up.railway.app")
+
+# Cascaded pipeline knobs (env-overridable so we don't have to redeploy to swap voice/model).
+OPENAI_LLM_MODEL = os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini")
+OPENAI_LLM_TEMPERATURE = float(os.getenv("OPENAI_LLM_TEMPERATURE", "0.7"))
+OPENAI_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "whisper-1")
+GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+# Female, conversational, customer-service-friendly Gemini voice.
+# Other good picks: "Leda", "Kore", "Vindemiatrix", "Achird".
+GEMINI_VOICE = os.getenv("GEMINI_VOICE", "Aoede")
+# Gemini API key. Plugin defaults to reading GOOGLE_API_KEY, but our deploy
+# uses GEMINI_API_KEY — we read either and pass it explicitly to the plugin.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 CONFIG_DIR = Path(__file__).parent / "config"
 
@@ -287,11 +299,19 @@ class VTAAgent(Agent):
             room_name = room.name or ""
             closing = CLOSING_MESSAGES.get(status, CLOSING_MESSAGES["other"])
 
-            # Tiny grace period so the Realtime model's tool-result acknowledgment
-            # doesn't stomp on the first syllable of our closing line.
-            await asyncio.sleep(0.3)
+            # Cancel any in-flight LLM reply / TTS playback. With a cascaded
+            # pipeline the LLM tends to generate a short acknowledgment after
+            # a tool call (e.g. "Okay, thank you...") — we don't want that
+            # prefixed onto our deterministic closing line.
+            try:
+                session.interrupt()
+            except Exception as e:
+                logger.warning(f"session.interrupt() before closing failed: {e}")
+            await asyncio.sleep(0.15)
 
-            # Step 1 — speak closing, wait for playout.
+            # Step 1 — speak closing verbatim and wait for full playout.
+            # Gemini TTS plugin's default instructions enforce verbatim
+            # ("Say the text with a proper tone, don't omit or add any words").
             try:
                 handle = await session.say(closing, allow_interruptions=False)
                 if handle is not None and hasattr(handle, "wait_for_playout"):
@@ -438,22 +458,39 @@ async def entrypoint(ctx: agents.JobContext):
 
     vta_agent = VTAAgent(phone=phone, customer_info=customer_info, ctx=ctx)
 
-    # Pin input transcription to whisper-1 + English.
-    # IMPORTANT: gpt-4o-realtime-preview only accepts "whisper-1" as the
-    # input_audio_transcription model — other model names cause the Realtime
-    # session update to be rejected by OpenAI, which silently kills audio.
+    # Cascaded STT -> LLM -> TTS pipeline.
+    #
+    # Why cascaded (vs the previous Realtime model):
+    #   - Verbatim closings: TTS faithfully speaks the exact CLOSING_MESSAGES
+    #     text. Realtime models paraphrase even when instructed not to.
+    #   - Cheaper per minute (Whisper + 4o-mini + Gemini Flash TTS).
+    #   - Easy to swap any leg independently via env vars.
+    #
+    # STT: OpenAI Whisper, English-pinned (avoid silent failures from foreign
+    #      transcripts upstream of the LLM).
+    # LLM: OpenAI gpt-4o-mini by default — fast, cheap, follows instructions
+    #      well. Override via OPENAI_LLM_MODEL=gpt-4o for harder calls.
+    # TTS: Google Gemini 2.5 Flash Preview TTS. The plugin's default
+    #      `instructions` ("Say the text with a proper tone, don't omit or
+    #      add any words") is exactly the verbatim guarantee we want for
+    #      compliance-sensitive closings.
+    # VAD: Silero (required for cascaded pipelines — drives turn detection).
     session = AgentSession(
-        llm=openai.realtime.RealtimeModel(
-            voice="shimmer",
-            model="gpt-4o-realtime-preview",
-            temperature=0.8,
-            modalities=["audio", "text"],
-            input_audio_transcription=AudioTranscription(
-                model="whisper-1",
-                language="en",
-                prompt="English only. Transcribe non-English words phonetically in English characters.",
-            ),
+        stt=openai.STT(
+            model=OPENAI_STT_MODEL,
+            language="en",
+            prompt="English only. Transcribe non-English words phonetically in English characters.",
         ),
+        llm=openai.LLM(
+            model=OPENAI_LLM_MODEL,
+            temperature=OPENAI_LLM_TEMPERATURE,
+        ),
+        tts=GeminiTTS(
+            model=GEMINI_TTS_MODEL,
+            voice_name=GEMINI_VOICE,
+            api_key=GEMINI_API_KEY,
+        ),
+        vad=silero.VAD.load(),
     )
 
     await session.start(
