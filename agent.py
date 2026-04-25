@@ -306,17 +306,35 @@ class VTAAgent(Agent):
         self._full_name = full_name
 
     def _resolve_sip_identity(self, session: AgentSession) -> str:
-        """Best-effort: figure out which participant identity is the SIP leg from TCN."""
-        linked_participant = getattr(getattr(session, "room_io", None), "linked_participant", None)
+        """Best-effort: figure out which participant identity is the SIP leg from TCN.
+
+        AgentSession in livekit-agents 1.x does NOT expose `.room` directly —
+        the room lives on `session.room_io.room` AND on `self._ctx.room`. We
+        prefer `self._ctx.room` (JobContext.room) because it's stable from the
+        moment the job starts. We also try `room_io.linked_participant` as a
+        fast path for the "this is definitely the SIP leg" case.
+        """
+        # Fast path: room_io.linked_participant is set when set_participant()
+        # was called or auto-detected — and if it's a SIP kind, that IS our leg.
+        room_io_obj = getattr(session, "room_io", None)
+        linked_participant = getattr(room_io_obj, "linked_participant", None)
         if (
             linked_participant is not None
-            and linked_participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+            and getattr(linked_participant, "kind", None) == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
         ):
             self._sip_identity = linked_participant.identity or self._sip_identity
 
-        participant = find_primary_sip_participant(session.room, preferred_identity=self._sip_identity)
-        if participant is not None:
-            self._sip_identity = participant.identity or self._sip_identity
+        # Fallback: scan the room. Try ctx.room first (stable), then room_io.room.
+        room: rtc.Room | None = None
+        if self._ctx is not None:
+            room = getattr(self._ctx, "room", None)
+        if room is None and room_io_obj is not None:
+            room = getattr(room_io_obj, "room", None)
+
+        if room is not None:
+            participant = find_primary_sip_participant(room, preferred_identity=self._sip_identity)
+            if participant is not None:
+                self._sip_identity = participant.identity or self._sip_identity
 
         return self._sip_identity
 
@@ -371,135 +389,189 @@ class VTAAgent(Agent):
             summary: Brief one-line description of what happened during the call.
             full_name: The customer's name.
         """
-        logger.info(
-            f"log_verification called: phone={self._phone} status={status} "
-            f"summary={summary!r}"
-        )
-
-        # Idempotency — if the LLM somehow calls this twice, no-op the second.
-        if self._ending:
-            logger.warning("log_verification called twice — second call ignored")
-            return None
-        self._ending = True
-        self._full_name = full_name or self._full_name
-
-        # Disable interruptions for the rest of this tool call. Per LiveKit
-        # docs, this is required for any tool that takes non-rollbackable
-        # external actions (we're about to log + speak + hang up SIP).
+        # Outermost shield: this tool MUST NOT raise. If it raises, the LLM
+        # gets an error response and starts ad-libbing ("An internal error
+        # has occurred"), which (a) isn't deterministic and (b) doesn't end
+        # the call. Every code path below is wrapped, and we always return
+        # None, even on catastrophic failure.
         try:
-            context.disallow_interruptions()
-        except Exception as e:
-            logger.warning(f"disallow_interruptions failed (continuing): {e}")
-
-        session: AgentSession = context.session
-        room = session.room
-        room_name = room.name or ""
-        closing = CLOSING_MESSAGES.get(status, CLOSING_MESSAGES["other"])
-
-        # Step 1 — log to the Railway server (Retell-compatible contract).
-        # Best-effort: failure here doesn't block hangup; the server-side
-        # pruner reconciles via /retell-call-ended below.
-        try:
-            await log_verification_to_server(self._phone, status, summary, full_name)
-        except Exception as e:
-            logger.error(f"log_verification_to_server failed; continuing: {e}")
-
-        # Step 2 — drain any speech that's already in flight (e.g. the LLM
-        # was mid-sentence when it decided to call this tool). Per docs:
-        # "Use ctx.wait_for_playout() to wait for any pre-tool speech to finish."
-        try:
-            await context.wait_for_playout()
-        except Exception as e:
-            logger.warning(f"wait_for_playout (pre-closing) failed: {e}")
-
-        # Step 3 — speak the deterministic closing INLINE and wait for it
-        # to fully play out. allow_interruptions=False so caller speech
-        # (or anything else) can't truncate it.
-        try:
-            handle = await session.say(closing, allow_interruptions=False)
-            if handle is not None and hasattr(handle, "wait_for_playout"):
-                await handle.wait_for_playout()
-            else:
-                # Fallback timing estimate (~14 chars/sec TTS rate).
-                await asyncio.sleep(max(3.0, len(closing) / 14.0))
-        except Exception as e:
-            logger.error(f"session.say closing failed ({status}): {e}")
-            # Don't let TTS failure block hangup. Short safety wait so any
-            # in-flight audio drains before we drop the SIP leg.
-            await asyncio.sleep(1.5)
-
-        # Step 4 — notify the Railway server the call ended (Retell-compatible).
-        # Best-effort, fire-and-forget on failure.
-        if not self._call_end_notified:
-            duration_ms = max(0, int((time.monotonic() - self._call_started_at) * 1000))
-            try:
-                await notify_call_ended(
-                    phone=self._phone,
-                    call_id=room_name,
-                    duration_ms=duration_ms,
-                    disconnection_reason=f"agent_end_call:{status}",
-                )
-            except Exception as e:
-                logger.error(f"notify_call_ended failed ({status}): {e}")
-            self._call_end_notified = True
-
-        # Step 5 — locate the customer-facing SIP leg (TCN's leg B).
-        sip_identity = self._resolve_sip_identity(session)
-
-        # Step 6 — surgical hangup: remove ONLY the SIP participant.
-        # This sends a clean BYE on leg B back to TCN with
-        # disconnect_reason=PARTICIPANT_REMOVED. TCN's broadcast template
-        # treats this as Action OK and advances:
-        #   Linkback -> Data Dip (/verification-status) -> Set Value -> Hunt Group
-        # Leg A (TCN <-> Customer) is untouched.
-        removed_ok = False
-        if self._ctx is not None and room_name and sip_identity:
-            try:
-                await self._ctx.api.room.remove_participant(
-                    api.RoomParticipantIdentity(
-                        room=room_name,
-                        identity=sip_identity,
-                    )
-                )
-                removed_ok = True
-                logger.info(
-                    f"[END_CALL] status={status} phone={self._phone} "
-                    f"room={room_name} sip_identity={sip_identity} "
-                    f"tcn_http={tcn_http_code_for_status(status)} "
-                    f"— SIP participant removed, BYE en route to TCN"
-                )
-            except Exception as e:
-                logger.error(
-                    f"[END_CALL] remove_participant failed for "
-                    f"{sip_identity} in {room_name}: {e}"
-                )
-
-        # Step 7 — fallback if we couldn't identify/remove the SIP participant.
-        # delete_room is a heavier hammer (BYE with disconnect_reason=ROOM_DELETED)
-        # but at least guarantees the call ends rather than leaving a stuck leg.
-        if not removed_ok:
-            logger.warning(
-                f"[END_CALL] no SIP identity to remove "
-                f"(sip_identity={sip_identity or 'not-found'}); falling back to delete_room"
+            logger.info(
+                f"log_verification called: phone={self._phone} status={status} "
+                f"summary={summary!r}"
             )
-            if self._ctx is not None and room_name:
-                try:
-                    await self._ctx.api.room.delete_room(
-                        api.DeleteRoomRequest(room=room_name)
-                    )
-                    logger.info(f"[END_CALL] delete_room fallback fired for room={room_name}")
-                except Exception as e:
-                    logger.error(f"[END_CALL] delete_room fallback failed: {e}")
-                    # Last resort — disconnect ourselves so the worker job doesn't hang.
-                    try:
-                        await room.disconnect()
-                    except Exception as e2:
-                        logger.error(f"[END_CALL] room.disconnect last-resort failed: {e2}")
 
-        # Return None so the LLM has no string to chew on. The SIP leg is
-        # already gone by this point, so any follow-up the LLM tries to emit
-        # has no audience.
-        return None
+            # Idempotency — if the LLM somehow calls this twice, no-op the second.
+            if self._ending:
+                logger.warning("log_verification called twice — second call ignored")
+                return None
+            self._ending = True
+            self._full_name = full_name or self._full_name
+
+            # Disable interruptions for the rest of this tool call. Per LiveKit
+            # docs, this is required for any tool that takes non-rollbackable
+            # external actions (we're about to log + speak + hang up SIP).
+            try:
+                context.disallow_interruptions()
+            except Exception as e:
+                logger.warning(f"disallow_interruptions failed (continuing): {e}")
+
+            session: AgentSession = context.session
+            # IMPORTANT: AgentSession does NOT expose `.room` in livekit-agents
+            # 1.x. The room lives on the JobContext (self._ctx.room) and on
+            # session.room_io.room. We use ctx.room as the primary source
+            # because it's stable from job start. Anything that goes wrong
+            # here we degrade gracefully — never raise.
+            room: rtc.Room | None = None
+            if self._ctx is not None:
+                room = getattr(self._ctx, "room", None)
+            if room is None:
+                room = getattr(getattr(session, "room_io", None), "room", None)
+
+            room_name = (room.name if room is not None else "") or ""
+            closing = CLOSING_MESSAGES.get(status, CLOSING_MESSAGES["other"])
+
+            # Step 1 — log to the Railway server (Retell-compatible contract).
+            # Best-effort: failure here doesn't block hangup; the server-side
+            # pruner reconciles via /retell-call-ended below.
+            try:
+                await log_verification_to_server(self._phone, status, summary, full_name)
+            except Exception as e:
+                logger.error(f"log_verification_to_server failed; continuing: {e}")
+
+            # Step 2 — drain any speech that's already in flight (e.g. the LLM
+            # was mid-sentence when it decided to call this tool). Per docs:
+            # "Use ctx.wait_for_playout() to wait for any pre-tool speech to finish."
+            try:
+                await context.wait_for_playout()
+            except Exception as e:
+                logger.warning(f"wait_for_playout (pre-closing) failed: {e}")
+
+            # Step 3 — speak the deterministic closing INLINE and wait for it
+            # to fully play out. allow_interruptions=False so caller speech
+            # (or anything else) can't truncate it.
+            #
+            # CRITICAL API DETAIL: session.say() is NOT a coroutine — it
+            # returns SpeechHandle directly. Do NOT `await session.say(...)`;
+            # that would await SpeechHandle.__await__ (which yields the
+            # internal future result, NOT the handle), and the variable
+            # would no longer be the SpeechHandle. Get the handle first,
+            # then await wait_for_playout() on it.
+            spoke_ok = False
+            try:
+                speech_handle = session.say(closing, allow_interruptions=False)
+                await speech_handle.wait_for_playout()
+                spoke_ok = True
+            except Exception as e:
+                logger.error(f"session.say closing failed ({status}): {e}")
+
+            if not spoke_ok:
+                # Fallback timing estimate (~14 chars/sec TTS rate) so the
+                # SIP leg isn't dropped on top of any in-flight audio.
+                try:
+                    await asyncio.sleep(max(3.0, len(closing) / 14.0))
+                except Exception:
+                    pass
+
+            # Step 4 — notify the Railway server the call ended (Retell-compatible).
+            if not self._call_end_notified:
+                duration_ms = max(0, int((time.monotonic() - self._call_started_at) * 1000))
+                try:
+                    await notify_call_ended(
+                        phone=self._phone,
+                        call_id=room_name,
+                        duration_ms=duration_ms,
+                        disconnection_reason=f"agent_end_call:{status}",
+                    )
+                except Exception as e:
+                    logger.error(f"notify_call_ended failed ({status}): {e}")
+                self._call_end_notified = True
+
+            # Step 5 — locate the customer-facing SIP leg (TCN's leg B).
+            sip_identity = ""
+            try:
+                sip_identity = self._resolve_sip_identity(session)
+            except Exception as e:
+                logger.error(f"[END_CALL] _resolve_sip_identity failed: {e}")
+
+            # Step 6 — surgical hangup: remove ONLY the SIP participant.
+            # This sends a clean BYE on leg B back to TCN with
+            # disconnect_reason=PARTICIPANT_REMOVED. TCN's broadcast template
+            # treats this as Action OK and advances:
+            #   Linkback -> Data Dip (/verification-status) -> Set Value -> Hunt Group
+            # Leg A (TCN <-> Customer) is untouched.
+            removed_ok = False
+            if self._ctx is not None and room_name and sip_identity:
+                try:
+                    await self._ctx.api.room.remove_participant(
+                        api.RoomParticipantIdentity(
+                            room=room_name,
+                            identity=sip_identity,
+                        )
+                    )
+                    removed_ok = True
+                    logger.info(
+                        f"[END_CALL] status={status} phone={self._phone} "
+                        f"room={room_name} sip_identity={sip_identity} "
+                        f"tcn_http={tcn_http_code_for_status(status)} "
+                        f"— SIP participant removed, BYE en route to TCN"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[END_CALL] remove_participant failed for "
+                        f"{sip_identity} in {room_name}: {e}"
+                    )
+
+            # Step 7 — fallback if we couldn't identify/remove the SIP participant.
+            # delete_room is a heavier hammer (BYE with disconnect_reason=ROOM_DELETED)
+            # but at least guarantees the call ends rather than leaving a stuck leg.
+            if not removed_ok:
+                logger.warning(
+                    f"[END_CALL] no SIP identity to remove "
+                    f"(sip_identity={sip_identity or 'not-found'}); falling back to delete_room"
+                )
+                if self._ctx is not None and room_name:
+                    try:
+                        await self._ctx.api.room.delete_room(
+                            api.DeleteRoomRequest(room=room_name)
+                        )
+                        logger.info(f"[END_CALL] delete_room fallback fired for room={room_name}")
+                    except Exception as e:
+                        logger.error(f"[END_CALL] delete_room fallback failed: {e}")
+                        # Last resort — disconnect ourselves so the worker job doesn't hang.
+                        if room is not None:
+                            try:
+                                await room.disconnect()
+                            except Exception as e2:
+                                logger.error(f"[END_CALL] room.disconnect last-resort failed: {e2}")
+
+            # Return None so the LLM has no string to chew on. The SIP leg is
+            # already gone by this point, so any follow-up the LLM tries to emit
+            # has no audience.
+            return None
+
+        except Exception as fatal:
+            # Last-ditch shield. If anything in the tool body raised
+            # unexpectedly, we still try to drop the SIP leg so the call
+            # doesn't hang, and we swallow the error so the LLM doesn't
+            # apologize about an "internal error" in the customer's ear.
+            logger.exception(f"[END_CALL] FATAL in log_verification: {fatal}")
+            try:
+                if self._ctx is not None:
+                    fallback_room = getattr(self._ctx, "room", None)
+                    fallback_name = (fallback_room.name if fallback_room is not None else "") or ""
+                    if fallback_name:
+                        try:
+                            await self._ctx.api.room.delete_room(
+                                api.DeleteRoomRequest(room=fallback_name)
+                            )
+                            logger.info(
+                                f"[END_CALL] FATAL-path delete_room fired for room={fallback_name}"
+                            )
+                        except Exception as e:
+                            logger.error(f"[END_CALL] FATAL-path delete_room failed: {e}")
+            except Exception as e:
+                logger.error(f"[END_CALL] FATAL-path shield itself failed: {e}")
+            return None
 
 
 async def entrypoint(ctx: agents.JobContext):
