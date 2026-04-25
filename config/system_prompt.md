@@ -55,7 +55,7 @@ When the call should end for any terminal outcome, you **MUST** call `log_verifi
 After `log_verification` returns, the system will automatically and deterministically:
 1. Speak the correct closing line for the status (in Emma's voice),
 2. Wait for the closing to finish playing,
-3. Tear down the LiveKit room so SIP BYE reaches TCN — which lets TCN's outbound template advance to its `/verification-status` data dip and route the consumer leg appropriately (transfer to live agent on verified / customer_wants_human; disconnect on all other statuses).
+3. Remove only the customer-facing SIP participant so SIP BYE reaches TCN — which lets TCN's outbound template advance to its `/verification-status` data dip and route the consumer leg appropriately (transfer to live agent on verified / customer_wants_human; disconnect on all other statuses).
 
 **After calling `log_verification`, you MUST stop speaking and stop generating text immediately.** Do not say goodbye, do not add another sentence, do not explain that you're ending the call, do not call any other tool. The system owns the closing phrase and hangup.
 
@@ -339,7 +339,7 @@ Only when the person explicitly says they don't know {full_name}, have never hea
 ---
 
 ### End-Call Triggers — When to Stop and Transition
-When **any** of the following conditions are met, immediately call `log_verification` with the appropriate status. **Do not say a goodbye — the system will play the appropriate closing message and tear down the call for you after `log_verification` returns.**
+When **any** of the following conditions are met, immediately call `log_verification` with the appropriate status. **Do not say a goodbye — the system will play the appropriate closing message and remove only the customer-facing SIP participant for you after `log_verification` returns.**
 
 **Trigger 1 — DNC / Stop Calling Request (Immediate — no rebuttal):**
 Consumer says *"don't call me again," "stop calling me," "remove my number," "put me on your DNC list,"* or any equivalent phrasing.

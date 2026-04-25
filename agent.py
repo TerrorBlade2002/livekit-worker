@@ -19,6 +19,7 @@ from livekit.agents import (
     RunContext,
     function_tool,
 )
+from livekit.agents.voice import room_io
 from livekit.plugins import openai, silero
 from livekit.plugins.google.beta import GeminiTTS
 
@@ -73,6 +74,8 @@ CLOSING_MESSAGES = {
     ),
 }
 
+TCN_TRANSFER_STATUSES = {"verified", "customer_wants_human"}
+
 
 def load_prompt(filename: str) -> str:
     """Read a prompt template from the config directory.
@@ -88,6 +91,76 @@ def normalize_phone(raw: str) -> str:
     """Normalize phone to last 10 digits, matching the Railway server logic."""
     digits = re.sub(r"\D", "", raw)
     return digits[-10:] if len(digits) >= 10 else digits
+
+
+def tcn_http_code_for_status(status: str) -> int:
+    """Map the final agent status to the HTTP code TCN should later receive."""
+    return 200 if status in TCN_TRANSFER_STATUSES else 409
+
+
+def extract_phone_from_participant(participant: rtc.RemoteParticipant) -> str:
+    """Extract a real customer phone number from participant state.
+
+    Do not fall back to `sip.callID` here. That is a SIP call tag, not the
+    customer phone number that the webhook server and TCN expect.
+    """
+    attrs = participant.attributes or {}
+    metadata = {}
+
+    if participant.metadata:
+        try:
+            metadata = json.loads(participant.metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+
+    candidates = [
+        attrs.get("sip.phoneNumber", ""),
+        attrs.get("phone", ""),
+        attrs.get("customer_phone", ""),
+        metadata.get("phone", ""),
+        metadata.get("caller_id", ""),
+        participant.identity or "",
+    ]
+
+    for candidate in candidates:
+        phone = normalize_phone(candidate)
+        if len(phone) == 10:
+            return phone
+
+    return ""
+
+
+def find_primary_sip_participant(
+    room: rtc.Room,
+    preferred_identity: str = "",
+) -> rtc.RemoteParticipant | None:
+    """Pick the customer-facing SIP leg the agent should listen to and remove."""
+    participants = list(room.remote_participants.values())
+
+    if preferred_identity:
+        for participant in participants:
+            if (
+                participant.identity == preferred_identity
+                and participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+            ):
+                return participant
+
+    sip_participants = [
+        participant
+        for participant in participants
+        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+    ]
+    if not sip_participants:
+        return None
+
+    def participant_rank(participant: rtc.RemoteParticipant) -> tuple[int, int]:
+        status = ((participant.attributes or {}).get("sip.callStatus", "") or "").lower()
+        active_rank = 0 if status == "active" else 1
+        missing_phone_rank = 0 if extract_phone_from_participant(participant) else 1
+        return (active_rank, missing_phone_rank)
+
+    sip_participants.sort(key=participant_rank)
+    return sip_participants[0]
 
 
 async def fetch_customer_info(phone: str) -> dict:
@@ -175,12 +248,19 @@ async def log_verification_to_server(phone: str, status: str, summary: str, full
 class VTAAgent(Agent):
     """Virtual Transfer Agent — Emma (LiveKit replacement for Retell's Emma)."""
 
-    def __init__(self, phone: str, customer_info: dict, ctx: agents.JobContext | None = None):
+    def __init__(
+        self,
+        phone: str,
+        customer_info: dict,
+        ctx: agents.JobContext | None = None,
+        sip_identity: str = "",
+    ):
         self._phone = phone
         self._customer_info = customer_info
         self._call_started_at = time.monotonic()
         self._call_end_notified = False
         self._ctx = ctx
+        self._sip_identity = sip_identity
         self._ending = False  # guards against double-trigger of the end-call sequence
 
         full_name = customer_info.get("full_name", "the customer")
@@ -212,8 +292,9 @@ class VTAAgent(Agent):
 
         You MUST call this exactly once per call, at the terminal point of the
         conversation. After this function returns, the system will deterministically
-        speak the appropriate closing line, wait for it to finish, and then tear
-        down the LiveKit room — which sends SIP BYE back to TCN. You MUST NOT
+        speak the appropriate closing line, wait for it to finish, and then remove
+        only the customer-facing SIP participant — which sends SIP BYE back to TCN.
+        You MUST NOT
         speak a goodbye yourself; the closing is played by the system.
 
         Args:
@@ -230,6 +311,7 @@ class VTAAgent(Agent):
             return json.dumps({
                 "success": True,
                 "status": status,
+                "expected_tcn_http_code": tcn_http_code_for_status(status),
                 "message": "Already ending. Say nothing else.",
             })
         self._ending = True
@@ -252,12 +334,27 @@ class VTAAgent(Agent):
         return json.dumps({
             "success": True,
             "status": status,
+            "expected_tcn_http_code": tcn_http_code_for_status(status),
             "message": (
                 "Verification logged. The system is now speaking the closing "
-                "message and tearing down the call. Do NOT generate any more "
+                "message and removing the customer SIP leg only. Do NOT generate any more "
                 "text or audio."
             ),
         })
+
+    async def _resolve_sip_identity(self, session: AgentSession) -> str:
+        linked_participant = getattr(getattr(session, "room_io", None), "linked_participant", None)
+        if (
+            linked_participant is not None
+            and linked_participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+        ):
+            self._sip_identity = linked_participant.identity or self._sip_identity
+
+        participant = find_primary_sip_participant(session.room, preferred_identity=self._sip_identity)
+        if participant is not None:
+            self._sip_identity = participant.identity or self._sip_identity
+
+        return self._sip_identity
 
     # ------------------------------------------------------------------
     # Deterministic end-call sequence.
@@ -340,12 +437,8 @@ class VTAAgent(Agent):
                     logger.error(f"notify_call_ended failed ({status}): {e}")
                 self._call_end_notified = True
 
-            # Step 3 — locate the SIP participant (leg B from TCN).
-            sip_identity = ""
-            for p in room.remote_participants.values():
-                if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
-                    sip_identity = p.identity or ""
-                    break
+            # Step 3 — locate the customer-facing SIP participant (leg B from TCN).
+            sip_identity = await self._resolve_sip_identity(session)
 
             # Step 4 — surgical hangup: remove ONLY the SIP participant.
             # LiveKit SIP sends a clean BYE to TCN; leg A on TCN is untouched.
@@ -362,6 +455,7 @@ class VTAAgent(Agent):
                     logger.info(
                         f"[END_CALL] status={status} phone={self._phone} "
                         f"room={room_name} sip_identity={sip_identity} "
+                        f"tcn_http={tcn_http_code_for_status(status)} "
                         f"— SIP participant removed, BYE en route to TCN"
                     )
                 except Exception as e:
@@ -395,40 +489,42 @@ async def entrypoint(ctx: agents.JobContext):
     await ctx.connect()
 
     phone = ""
+    sip_identity = ""
     customer_info = {}
 
     logger.info("Waiting for SIP participant...")
 
-    def find_sip_phone() -> str:
-        for p in ctx.room.remote_participants.values():
-            identity = p.identity or ""
-            logger.info(f"Participant: identity={identity}, name={p.name}, metadata={p.metadata}")
-            attrs = p.attributes or {}
-            sip_phone = attrs.get("sip.phoneNumber", "") or attrs.get("sip.callID", "")
-            if sip_phone:
-                return sip_phone
-            phone_match = re.search(r"\+?1?(\d{10})", identity)
-            if phone_match:
-                return phone_match.group(1)
-            if p.metadata:
-                try:
-                    meta = json.loads(p.metadata)
-                    if "phone" in meta:
-                        return meta["phone"]
-                except (json.JSONDecodeError, TypeError):
-                    pass
-        return ""
+    def refresh_sip_context() -> None:
+        nonlocal phone, sip_identity
+        participant = find_primary_sip_participant(ctx.room, preferred_identity=sip_identity)
+        if participant is None:
+            return
 
-    phone = find_sip_phone()
+        sip_identity = participant.identity or sip_identity
+        extracted_phone = extract_phone_from_participant(participant)
+        if extracted_phone:
+            phone = extracted_phone
+
+        logger.info(
+            "Primary SIP participant: identity=%s callStatus=%s phone=%s metadata=%s",
+            participant.identity,
+            (participant.attributes or {}).get("sip.callStatus", ""),
+            phone,
+            participant.metadata,
+        )
+
+    refresh_sip_context()
 
     if not phone:
         participant_connected = asyncio.Event()
 
         @ctx.room.on("participant_connected")
         def on_participant_connected(participant: rtc.RemoteParticipant):
-            nonlocal phone
-            phone = find_sip_phone()
-            participant_connected.set()
+            if participant.kind != rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+                return
+            refresh_sip_context()
+            if phone:
+                participant_connected.set()
 
         try:
             await asyncio.wait_for(participant_connected.wait(), timeout=30.0)
@@ -438,14 +534,14 @@ async def entrypoint(ctx: agents.JobContext):
     if not phone and ctx.job.metadata:
         try:
             meta = json.loads(ctx.job.metadata)
-            phone = meta.get("phone", "") or meta.get("caller_id", "")
+            phone = normalize_phone(meta.get("phone", "") or meta.get("caller_id", ""))
         except (json.JSONDecodeError, TypeError):
             pass
 
     if not phone:
         room_match = re.search(r"(\d{10,})", ctx.room.name)
         if room_match:
-            phone = room_match.group(1)
+            phone = normalize_phone(room_match.group(1))
 
     logger.info(f"Caller phone: {phone}")
 
@@ -456,7 +552,12 @@ async def entrypoint(ctx: agents.JobContext):
         customer_info["full_name"] = "the customer"
         logger.warning(f"No customer info found for phone {phone}")
 
-    vta_agent = VTAAgent(phone=phone, customer_info=customer_info, ctx=ctx)
+    vta_agent = VTAAgent(
+        phone=phone,
+        customer_info=customer_info,
+        ctx=ctx,
+        sip_identity=sip_identity,
+    )
 
     # Cascaded STT -> LLM -> TTS pipeline.
     #
@@ -493,10 +594,25 @@ async def entrypoint(ctx: agents.JobContext):
         vad=silero.VAD.load(),
     )
 
-    await session.start(
-        room=ctx.room,
-        agent=vta_agent,
+    room_options = room_io.RoomOptions(
+        participant_kinds=[rtc.ParticipantKind.PARTICIPANT_KIND_SIP],
+        delete_room_on_close=False,
     )
+    if sip_identity:
+        room_options = room_io.RoomOptions(
+            participant_kinds=[rtc.ParticipantKind.PARTICIPANT_KIND_SIP],
+            participant_identity=sip_identity,
+            delete_room_on_close=False,
+        )
+
+    await session.start(room=ctx.room, agent=vta_agent, room_options=room_options)
+
+    linked_participant = getattr(getattr(session, "room_io", None), "linked_participant", None)
+    if linked_participant is not None and linked_participant.identity:
+        vta_agent._sip_identity = linked_participant.identity
+        if not phone:
+            phone = extract_phone_from_participant(linked_participant)
+            vta_agent._phone = phone
 
     # Ambient call-center background audio — published on a separate outbound
     # track, never mixed into the Realtime TTS stream or fed back into STT.
