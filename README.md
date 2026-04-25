@@ -18,7 +18,7 @@ Do not merge them into one deploy unless you intentionally want a combined archi
 | Stage | Provider | Default model                  | Override env             |
 | ----- | -------- | ------------------------------ | ------------------------ |
 | STT   | OpenAI   | `whisper-1` (English-pinned)   | `OPENAI_STT_MODEL`       |
-| LLM   | OpenAI   | `gpt-4o-mini`                  | `OPENAI_LLM_MODEL`, `OPENAI_LLM_TEMPERATURE` |
+| LLM   | OpenAI   | `gpt-4o`                       | `OPENAI_LLM_MODEL`, `OPENAI_LLM_TEMPERATURE` |
 | TTS   | Google   | `gemini-2.5-flash-preview-tts` | `GEMINI_TTS_MODEL`, `GEMINI_VOICE` |
 | VAD   | Silero   | (loaded locally)               | —                        |
 
@@ -57,7 +57,7 @@ Required:
 - `RAILWAY_SERVER_URL`
 
 Optional knobs (sensible defaults — only set to override):
-- `OPENAI_LLM_MODEL` (default `gpt-4o-mini`)
+- `OPENAI_LLM_MODEL` (default `gpt-4o` — drop to `gpt-4o-mini` only if cost is critical)
 - `OPENAI_LLM_TEMPERATURE` (default `0.7`)
 - `OPENAI_STT_MODEL` (default `whisper-1`)
 - `GEMINI_TTS_MODEL` (default `gemini-2.5-flash-preview-tts`)

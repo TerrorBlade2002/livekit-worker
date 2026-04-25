@@ -31,7 +31,10 @@ logger.setLevel(logging.INFO)
 RAILWAY_SERVER_URL = os.getenv("RAILWAY_SERVER_URL", "https://virtual-transfer-agent-production.up.railway.app")
 
 # Cascaded pipeline knobs (env-overridable so we don't have to redeploy to swap voice/model).
-OPENAI_LLM_MODEL = os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini")
+# gpt-4o (not -mini) — gpt-4o-mini was unreliable about firing the terminal
+# log_verification tool against this long, branchy system prompt. gpt-4o follows
+# the Terminal Tool Rule consistently. Override via env if cost is critical.
+OPENAI_LLM_MODEL = os.getenv("OPENAI_LLM_MODEL", "gpt-4o")
 OPENAI_LLM_TEMPERATURE = float(os.getenv("OPENAI_LLM_TEMPERATURE", "0.7"))
 OPENAI_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "whisper-1")
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
@@ -302,69 +305,8 @@ class VTAAgent(Agent):
         super().__init__(instructions=instructions)
         self._full_name = full_name
 
-    @function_tool()
-    async def log_verification(
-        self,
-        context: RunContext,
-        status: str,
-        summary: str,
-        full_name: str,
-    ) -> str:
-        """Log the terminal call outcome AND end the call.
-
-        You MUST call this exactly once per call, at the terminal point of the
-        conversation. After this function returns, the system will deterministically
-        speak the appropriate closing line, wait for it to finish, and then remove
-        only the customer-facing SIP participant — which sends SIP BYE back to TCN.
-        You MUST NOT
-        speak a goodbye yourself; the closing is played by the system.
-
-        Args:
-            status: The verification outcome. Must be one of:
-                "verified", "wrong_number", "third_party_end",
-                "consumer_busy_end", "dnc", "customer_wants_human", "other"
-            summary: Brief one-line description of what happened during the call.
-            full_name: The customer's name.
-        """
-        logger.info(f"log_verification called: phone={self._phone}, status={status}, summary={summary}")
-
-        if self._ending:
-            logger.warning("log_verification called twice — ignoring second invocation")
-            return json.dumps({
-                "success": True,
-                "status": status,
-                "expected_tcn_http_code": tcn_http_code_for_status(status),
-                "message": "Already ending. Say nothing else.",
-            })
-        self._ending = True
-        self._full_name = full_name or self._full_name
-
-        # 1) Log to the Railway server (Retell-compatible contract). If this
-        #    fails, we still want to proceed with the closing + hangup so the
-        #    call doesn't get stuck — the server-side pruner will eventually
-        #    reconcile via the call_ended webhook.
-        try:
-            await log_verification_to_server(self._phone, status, summary, full_name)
-        except Exception as e:
-            logger.error(f"log_verification_to_server failed; continuing to end-call: {e}")
-
-        # 2) Kick off the deterministic end-call sequence as a background task.
-        #    We return from the tool promptly so the Realtime model doesn't
-        #    keep generating tokens over our closing line.
-        asyncio.create_task(self._end_call_sequence(context, status))
-
-        return json.dumps({
-            "success": True,
-            "status": status,
-            "expected_tcn_http_code": tcn_http_code_for_status(status),
-            "message": (
-                "Verification logged. The system is now speaking the closing "
-                "message and removing the customer SIP leg only. Do NOT generate any more "
-                "text or audio."
-            ),
-        })
-
-    async def _resolve_sip_identity(self, session: AgentSession) -> str:
+    def _resolve_sip_identity(self, session: AgentSession) -> str:
+        """Best-effort: figure out which participant identity is the SIP leg from TCN."""
         linked_participant = getattr(getattr(session, "room_io", None), "linked_participant", None)
         if (
             linked_participant is not None
@@ -379,129 +321,185 @@ class VTAAgent(Agent):
         return self._sip_identity
 
     # ------------------------------------------------------------------
-    # Deterministic end-call sequence.
+    # log_verification — the single terminal tool.
     #
-    # Mirrors Retell's 3-way architecture:
-    #   - TCN leg A: TCN <-> Customer (stays up on TCN side)
-    #   - TCN leg B: TCN <-> LiveKit SIP (the SIP participant in this room)
-    #   - LiveKit room: { SIP participant, VTA agent }
+    # Mirrors TCN's bridge architecture:
+    #   - TCN leg A: TCN <-> Customer (TCN owns this — never touched here)
+    #   - TCN leg B: TCN <-> LiveKit SIP gateway (the SIP participant in
+    #     this room is the LiveKit-side endpoint of leg B)
+    #   - LiveKit room: { SIP participant, vta-emma agent }
     #
-    # Invariants this coroutine enforces for EVERY terminal status:
-    #   1. Emma speaks CLOSING_MESSAGES[status] verbatim; we await playout
-    #      so the final sentence is never truncated.
-    #   2. We notify /retell-call-ended once (Retell-compatible contract).
-    #   3. We REMOVE ONLY THE SIP PARTICIPANT via RemoveParticipant. This
-    #      sends a clean SIP BYE scoped to leg B back to TCN with
-    #      disconnect_reason=PARTICIPANT_REMOVED. TCN's outbound-dialer
-    #      template sees leg B end normally ("Action OK"), advances to its
-    #      "Data Dip" node, and fires:
-    #         GET /verification-status?phone=<dialed_number>
-    #      which returns 200 + whisper for verified / customer_wants_human
-    #      (TCN transfers leg A to the hunt group) or 409 (TCN drops leg A).
-    #      Leg A (TCN <-> Customer) is untouched by LiveKit — TCN owns it.
-    #   4. We do NOT call delete_room. Reasons:
-    #        - delete_room produces disconnect_reason=ROOM_DELETED on the
-    #          BYE, which some templates treat as abnormal termination.
-    #        - With the SIP participant gone, LiveKit auto-closes the
-    #          AgentSession (close_on_disconnect=True by default) and
-    #          auto-reaps the empty room after its grace period.
-    #        - Because our worker is registered with agent_name="vta-emma"
-    #          (explicit-dispatch only), LiveKit will NOT auto-redispatch
-    #          a new agent into the stale room.
-    #   5. All failures are caught — hangup must not be blocked by a
-    #      bookkeeping error.
+    # We follow LiveKit's canonical end-call pattern (telephony docs):
+    # do EVERYTHING inline-awaited inside the tool body. This guarantees
+    # the LLM cannot generate a stray follow-up reply before the SIP leg
+    # is gone, and that the BYE reaches TCN cleanly so the broadcast
+    # template fires Action OK and advances:
+    #   Linkback (Action OK) -> Data Dip -> Set Value -> Hunt Group.
+    #
+    # Specifically NOT used here:
+    #   - asyncio.create_task(...) for the end-call sequence — the prior
+    #     fire-and-forget pattern raced with the LLM's auto-generated
+    #     follow-up reply, often resulting in either a half-spoken closing
+    #     or a missed BYE that TCN treated as Action Error.
+    #   - session.interrupt() — wrong tool for the job in cascaded mode;
+    #     it cancels the speech queue but doesn't prevent the LLM from
+    #     enqueueing fresh audio after the tool returns.
+    #   - delete_room — produces disconnect_reason=ROOM_DELETED on the BYE
+    #     which some TCN templates treat as abnormal. We use
+    #     RemoveParticipant on SIP only (PARTICIPANT_REMOVED) so TCN sees
+    #     a clean leg-B teardown and fires Action OK.
     # ------------------------------------------------------------------
-    async def _end_call_sequence(self, context: RunContext, status: str) -> None:
+    @function_tool()
+    async def log_verification(
+        self,
+        context: RunContext,
+        status: str,
+        summary: str,
+        full_name: str,
+    ) -> None:
+        """Log the terminal call outcome AND end the call.
+
+        Call this exactly ONCE per call, at the terminal point of the
+        conversation. The system will speak the appropriate closing line
+        and tear down the SIP leg back to TCN. You MUST NOT speak any
+        goodbye yourself — the system owns the closing phrase.
+
+        Args:
+            status: The verification outcome. Must be one of:
+                "verified", "wrong_number", "third_party_end",
+                "consumer_busy_end", "dnc", "customer_wants_human", "other"
+            summary: Brief one-line description of what happened during the call.
+            full_name: The customer's name.
+        """
+        logger.info(
+            f"log_verification called: phone={self._phone} status={status} "
+            f"summary={summary!r}"
+        )
+
+        # Idempotency — if the LLM somehow calls this twice, no-op the second.
+        if self._ending:
+            logger.warning("log_verification called twice — second call ignored")
+            return None
+        self._ending = True
+        self._full_name = full_name or self._full_name
+
+        # Disable interruptions for the rest of this tool call. Per LiveKit
+        # docs, this is required for any tool that takes non-rollbackable
+        # external actions (we're about to log + speak + hang up SIP).
         try:
-            session: AgentSession = context.session
-            room = session.room
-            room_name = room.name or ""
-            closing = CLOSING_MESSAGES.get(status, CLOSING_MESSAGES["other"])
-
-            # Cancel any in-flight LLM reply / TTS playback. With a cascaded
-            # pipeline the LLM tends to generate a short acknowledgment after
-            # a tool call (e.g. "Okay, thank you...") — we don't want that
-            # prefixed onto our deterministic closing line.
-            try:
-                session.interrupt()
-            except Exception as e:
-                logger.warning(f"session.interrupt() before closing failed: {e}")
-            await asyncio.sleep(0.15)
-
-            # Step 1 — speak closing verbatim and wait for full playout.
-            # Gemini TTS plugin's default instructions enforce verbatim
-            # ("Say the text with a proper tone, don't omit or add any words").
-            try:
-                handle = await session.say(closing, allow_interruptions=False)
-                if handle is not None and hasattr(handle, "wait_for_playout"):
-                    await handle.wait_for_playout()
-                else:
-                    # Fallback timing estimate (~14 chars/sec TTS rate).
-                    await asyncio.sleep(max(3.0, len(closing) / 14.0))
-            except Exception as e:
-                logger.error(f"session.say closing failed ({status}): {e}")
-                # Don't let TTS failure block hangup. Short safety wait.
-                await asyncio.sleep(1.5)
-
-            # Step 2 — notify the Railway server that the call ended. Idempotent
-            # on our side via _call_end_notified, idempotent on server side via
-            # log_verification race-condition handling.
-            if not self._call_end_notified:
-                duration_ms = max(0, int((time.monotonic() - self._call_started_at) * 1000))
-                try:
-                    await notify_call_ended(
-                        phone=self._phone,
-                        call_id=room_name,
-                        duration_ms=duration_ms,
-                        disconnection_reason=f"agent_end_call:{status}",
-                    )
-                except Exception as e:
-                    logger.error(f"notify_call_ended failed ({status}): {e}")
-                self._call_end_notified = True
-
-            # Step 3 — locate the customer-facing SIP participant (leg B from TCN).
-            sip_identity = await self._resolve_sip_identity(session)
-
-            # Step 4 — surgical hangup: remove ONLY the SIP participant.
-            # LiveKit SIP sends a clean BYE to TCN; leg A on TCN is untouched.
-            removed_ok = False
-            if self._ctx is not None and room_name and sip_identity:
-                try:
-                    await self._ctx.api.room.remove_participant(
-                        api.RoomParticipantIdentity(
-                            room=room_name,
-                            identity=sip_identity,
-                        )
-                    )
-                    removed_ok = True
-                    logger.info(
-                        f"[END_CALL] status={status} phone={self._phone} "
-                        f"room={room_name} sip_identity={sip_identity} "
-                        f"tcn_http={tcn_http_code_for_status(status)} "
-                        f"— SIP participant removed, BYE en route to TCN"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[END_CALL] remove_participant failed for "
-                        f"{sip_identity} in {room_name}: {e}"
-                    )
-
-            # Step 5 — fallback only if we couldn't identify/remove the SIP
-            # participant. We self-disconnect so the job doesn't hang; the
-            # stranded SIP leg will BYE out on LiveKit's idle timeout.
-            if not removed_ok:
-                logger.warning(
-                    f"[END_CALL] falling back to room.disconnect() "
-                    f"(sip_identity={sip_identity or 'not-found'})"
-                )
-                try:
-                    await room.disconnect()
-                except Exception as e:
-                    logger.error(f"[END_CALL] room.disconnect also failed: {e}")
+            context.disallow_interruptions()
         except Exception as e:
-            # Catch-all: never let an exception inside end-call leak and leave
-            # the call hanging. If we got here something is very wrong — log it.
-            logger.error(f"[END_CALL] unexpected error (status={status}): {e}")
+            logger.warning(f"disallow_interruptions failed (continuing): {e}")
+
+        session: AgentSession = context.session
+        room = session.room
+        room_name = room.name or ""
+        closing = CLOSING_MESSAGES.get(status, CLOSING_MESSAGES["other"])
+
+        # Step 1 — log to the Railway server (Retell-compatible contract).
+        # Best-effort: failure here doesn't block hangup; the server-side
+        # pruner reconciles via /retell-call-ended below.
+        try:
+            await log_verification_to_server(self._phone, status, summary, full_name)
+        except Exception as e:
+            logger.error(f"log_verification_to_server failed; continuing: {e}")
+
+        # Step 2 — drain any speech that's already in flight (e.g. the LLM
+        # was mid-sentence when it decided to call this tool). Per docs:
+        # "Use ctx.wait_for_playout() to wait for any pre-tool speech to finish."
+        try:
+            await context.wait_for_playout()
+        except Exception as e:
+            logger.warning(f"wait_for_playout (pre-closing) failed: {e}")
+
+        # Step 3 — speak the deterministic closing INLINE and wait for it
+        # to fully play out. allow_interruptions=False so caller speech
+        # (or anything else) can't truncate it.
+        try:
+            handle = await session.say(closing, allow_interruptions=False)
+            if handle is not None and hasattr(handle, "wait_for_playout"):
+                await handle.wait_for_playout()
+            else:
+                # Fallback timing estimate (~14 chars/sec TTS rate).
+                await asyncio.sleep(max(3.0, len(closing) / 14.0))
+        except Exception as e:
+            logger.error(f"session.say closing failed ({status}): {e}")
+            # Don't let TTS failure block hangup. Short safety wait so any
+            # in-flight audio drains before we drop the SIP leg.
+            await asyncio.sleep(1.5)
+
+        # Step 4 — notify the Railway server the call ended (Retell-compatible).
+        # Best-effort, fire-and-forget on failure.
+        if not self._call_end_notified:
+            duration_ms = max(0, int((time.monotonic() - self._call_started_at) * 1000))
+            try:
+                await notify_call_ended(
+                    phone=self._phone,
+                    call_id=room_name,
+                    duration_ms=duration_ms,
+                    disconnection_reason=f"agent_end_call:{status}",
+                )
+            except Exception as e:
+                logger.error(f"notify_call_ended failed ({status}): {e}")
+            self._call_end_notified = True
+
+        # Step 5 — locate the customer-facing SIP leg (TCN's leg B).
+        sip_identity = self._resolve_sip_identity(session)
+
+        # Step 6 — surgical hangup: remove ONLY the SIP participant.
+        # This sends a clean BYE on leg B back to TCN with
+        # disconnect_reason=PARTICIPANT_REMOVED. TCN's broadcast template
+        # treats this as Action OK and advances:
+        #   Linkback -> Data Dip (/verification-status) -> Set Value -> Hunt Group
+        # Leg A (TCN <-> Customer) is untouched.
+        removed_ok = False
+        if self._ctx is not None and room_name and sip_identity:
+            try:
+                await self._ctx.api.room.remove_participant(
+                    api.RoomParticipantIdentity(
+                        room=room_name,
+                        identity=sip_identity,
+                    )
+                )
+                removed_ok = True
+                logger.info(
+                    f"[END_CALL] status={status} phone={self._phone} "
+                    f"room={room_name} sip_identity={sip_identity} "
+                    f"tcn_http={tcn_http_code_for_status(status)} "
+                    f"— SIP participant removed, BYE en route to TCN"
+                )
+            except Exception as e:
+                logger.error(
+                    f"[END_CALL] remove_participant failed for "
+                    f"{sip_identity} in {room_name}: {e}"
+                )
+
+        # Step 7 — fallback if we couldn't identify/remove the SIP participant.
+        # delete_room is a heavier hammer (BYE with disconnect_reason=ROOM_DELETED)
+        # but at least guarantees the call ends rather than leaving a stuck leg.
+        if not removed_ok:
+            logger.warning(
+                f"[END_CALL] no SIP identity to remove "
+                f"(sip_identity={sip_identity or 'not-found'}); falling back to delete_room"
+            )
+            if self._ctx is not None and room_name:
+                try:
+                    await self._ctx.api.room.delete_room(
+                        api.DeleteRoomRequest(room=room_name)
+                    )
+                    logger.info(f"[END_CALL] delete_room fallback fired for room={room_name}")
+                except Exception as e:
+                    logger.error(f"[END_CALL] delete_room fallback failed: {e}")
+                    # Last resort — disconnect ourselves so the worker job doesn't hang.
+                    try:
+                        await room.disconnect()
+                    except Exception as e2:
+                        logger.error(f"[END_CALL] room.disconnect last-resort failed: {e2}")
+
+        # Return None so the LLM has no string to chew on. The SIP leg is
+        # already gone by this point, so any follow-up the LLM tries to emit
+        # has no audience.
+        return None
 
 
 async def entrypoint(ctx: agents.JobContext):
@@ -602,8 +600,9 @@ async def entrypoint(ctx: agents.JobContext):
     #
     # STT: OpenAI Whisper, English-pinned (avoid silent failures from foreign
     #      transcripts upstream of the LLM).
-    # LLM: OpenAI gpt-4o-mini by default — fast, cheap, follows instructions
-    #      well. Override via OPENAI_LLM_MODEL=gpt-4o for harder calls.
+    # LLM: OpenAI gpt-4o by default — gpt-4o-mini was unreliable about calling
+    #      the terminal log_verification tool against this long system prompt.
+    #      Override via OPENAI_LLM_MODEL if cost is critical.
     # TTS: Google Gemini 2.5 Flash Preview TTS. The plugin's default
     #      `instructions` ("Say the text with a proper tone, don't omit or
     #      add any words") is exactly the verbatim guarantee we want for
