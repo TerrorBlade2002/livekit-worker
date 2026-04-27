@@ -22,8 +22,7 @@ from livekit.agents import (
     metrics,
 )
 from livekit.agents.voice import room_io
-from livekit.plugins import xai
-from livekit.plugins.xai import realtime as xai_realtime
+from livekit.plugins import openai as openai_plugin
 
 # ---------------------------------------------------------------------------
 # .env loading — robust against arbitrary cwd
@@ -73,17 +72,31 @@ RAILWAY_SERVER_URL = os.getenv(
 )
 
 # ---------------------------------------------------------------------------
-# Grok Realtime config
+# Grok Realtime config — grok-voice-think-fast-1.0
 #
-# We use the xAI Realtime API end-to-end (single STT+LLM+TTS model) to
-# minimise per-turn latency. Underlying model is `grok-4-1-fast-non-reasoning`
-# (hardcoded by the xai plugin's RealtimeModel as of livekit-plugins-xai 1.5.x).
-# This is NOT a chain-of-thought model — if you need reasoning, switch to the
-# cascaded path (LLM.with_x_ai(model="grok-4-1-fast-reasoning")), which costs
-# ~300-600ms more TTFT per turn.
+# Released 2026-04-25. Background-reasoning Realtime model — does
+# chain-of-thought between turns at no latency cost. Tops τ-voice Bench at
+# 67.3% (vs GPT Realtime 1.5 at 35.3%). Designed for production voice
+# agents with function/tool calling.
+#
+# We use the OpenAI Realtime API class directly (not the xai plugin's
+# RealtimeModel wrapper) because the wrapper hardcodes the older
+# `grok-4-1-fast-non-reasoning` model. The protocol is
+# OpenAI-Realtime-spec-compatible at the wire level, so the openai plugin's
+# Realtime client speaks it correctly when pointed at the xAI base URL.
 # ---------------------------------------------------------------------------
-# Grok voices: Ara (female, default), Eve (female), Leo (male), Rex (male), Sal (male).
-GROK_VOICE = os.getenv("GROK_VOICE", "Ara")
+GROK_REALTIME_BASE_URL = os.getenv(
+    "GROK_REALTIME_BASE_URL", "wss://api.x.ai/v1/realtime"
+)
+GROK_REALTIME_MODEL = os.getenv(
+    "GROK_REALTIME_MODEL", "grok-voice-think-fast-1.0"
+)
+# Grok voices (lowercase per xAI docs):
+#   ara (warm female, default), eve (energetic female), leo (authoritative male),
+#   rex (confident male), sal (neutral).
+GROK_VOICE = os.getenv("GROK_VOICE", "ara").lower()
+# Realtime model temperature (0.6-0.9 = natural; lower = more rigid).
+GROK_TEMPERATURE = float(os.getenv("GROK_TEMPERATURE", "0.7"))
 
 # AgentSession latency knobs — see docstrings on AgentSession for full details.
 # aec_warmup_duration default is 3.0s, which delays the opening line by
@@ -98,12 +111,37 @@ PREEMPTIVE_GENERATION = os.getenv("PREEMPTIVE_GENERATION", "true").lower() == "t
 MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.4"))
 MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "3.0"))
 
+# ---------------------------------------------------------------------------
+# Silence handling
+#
+# After the agent finishes speaking, the user_state goes to "listening". If
+# no user audio arrives for USER_AWAY_TIMEOUT seconds, AgentSession emits
+# user_state_changed -> "away". We hook that to:
+#   1. Speak "Are you still there?" once
+#   2. Start a SILENCE_FOLLOWUP_DELAY timer
+#   3. If still away when timer fires -> log_verification(status="other") to
+#      end the call cleanly through the same TCN-bridge teardown path
+#   4. If user comes back ("speaking" or "listening") -> cancel the timer
+#      and reset the warning state
+#
+# Default: 10s -> "Are you still there?", another 50s -> hangup (60s total).
+# ---------------------------------------------------------------------------
+USER_AWAY_TIMEOUT = float(os.getenv("USER_AWAY_TIMEOUT", "10"))  # seconds of silence -> "away"
+SILENCE_TOTAL_SECONDS = float(os.getenv("SILENCE_TOTAL_SECONDS", "60"))  # total silence -> hangup
+SILENCE_FOLLOWUP_DELAY = max(1.0, SILENCE_TOTAL_SECONDS - USER_AWAY_TIMEOUT)
+SILENCE_PROMPT_TEXT = os.getenv("SILENCE_PROMPT_TEXT", "Are you still there?")
+
 CONFIG_DIR = Path(__file__).parent / "config"
 
+# The opening line is hardcoded here (not in a template file) so it's
+# physically impossible for the LLM to ever rewrite it. Triggered via
+# session.generate_reply with strict verbatim instructions on first turn.
+OPENING_LINE_TEMPLATE = "Hi, this call is for {full_name}."
+
 # Closing messages are deterministic so hangup is reliable and in Emma's
-# voice; the LLM MUST NOT speak its own goodbye. We pass them through
-# generate_reply with verbatim instructions because Realtime models speak
-# via their own internal TTS pipeline (no separate session.say-able TTS).
+# voice. The Realtime model speaks them via session.generate_reply with
+# strict verbatim instructions — with grok-voice-think-fast-1.0's reasoning,
+# this is reliable; with the older non-reasoning model it was not.
 CLOSING_MESSAGES = {
     "verified": (
         "Thank you. We're calling regarding a personal business matter of yours. "
@@ -457,64 +495,66 @@ class VTAAgent(Agent):
         return self._sip_identity
 
     # ------------------------------------------------------------------
-    # log_verification — the single terminal tool.
+    # End-call architecture
     #
-    # Mirrors TCN's bridge architecture:
+    # ONE terminal tool: log_verification. It's a thin wrapper that
+    # delegates to _end_call (a private method), which is also called by
+    # the silence-timeout handler in entrypoint(). This keeps the BYE/TCN
+    # teardown path identical regardless of whether the LLM decided to end
+    # the call OR the user just went silent for 60s.
+    #
+    # TCN's bridge architecture:
     #   - TCN leg A: TCN <-> Customer (TCN owns this — never touched here)
     #   - TCN leg B: TCN <-> LiveKit SIP gateway (the SIP participant in
     #     this room is the LiveKit-side endpoint of leg B)
     #   - LiveKit room: { SIP participant, vta-emma agent }
     #
-    # With Realtime models, we use generate_reply(instructions=...) for the
-    # closing because session.say bypasses the model's own TTS in some
-    # configurations. generate_reply with verbatim instructions makes the
-    # Realtime model speak the exact closing through its own audio pipeline.
+    # The closing line is spoken via session.generate_reply with strict
+    # verbatim instructions. With grok-voice-think-fast-1.0 (reasoning
+    # Realtime), this is reliable because the model thinks before
+    # speaking — it follows verbatim instructions ~95%+. The older
+    # non-reasoning model paraphrased ~30-50% of the time which is why
+    # the previous deploy was missing closings.
     # ------------------------------------------------------------------
-    @function_tool()
-    async def log_verification(
+    async def _end_call(
         self,
-        context: RunContext,
         status: str,
         summary: str,
         full_name: str,
+        *,
+        session: AgentSession,
+        context: RunContext | None = None,
+        trigger: str = "tool",
     ) -> None:
-        """Log the terminal call outcome AND end the call.
+        """Internal end-call sequence — speak closing, log, hangup.
 
-        Call this exactly ONCE per call, at the terminal point of the
-        conversation. The system will speak the appropriate closing line
-        and tear down the SIP leg back to TCN. You MUST NOT speak any
-        goodbye yourself — the system owns the closing phrase.
-
-        Args:
-            status: The verification outcome. Must be one of:
-                "verified", "wrong_number", "third_party_end",
-                "consumer_busy_end", "dnc", "customer_wants_human", "other"
-            summary: Brief one-line description of what happened during the call.
-            full_name: The customer's name.
+        Called from BOTH the log_verification tool (trigger="tool") and
+        from the silence timeout handler (trigger="silence_timeout").
+        Idempotent: safe to call concurrently — second invocation no-ops.
         """
-        # Outermost shield: this tool MUST NOT raise. If it raises, the LLM
-        # gets an error response and starts ad-libbing ("An internal error
-        # has occurred"), which doesn't end the call. Every code path below
-        # is wrapped, and we always return None.
         try:
             tool_t0 = time.monotonic()
             logger.info(
-                f"log_verification called: phone={self._phone} status={status} "
+                f"[END_CALL] start trigger={trigger} phone={self._phone} status={status} "
                 f"summary={summary!r}"
             )
 
             if self._ending:
-                logger.warning("log_verification called twice — second call ignored")
-                return None
+                logger.warning(
+                    f"[END_CALL] already ending — second invocation ignored (trigger={trigger})"
+                )
+                return
             self._ending = True
             self._full_name = full_name or self._full_name
 
-            try:
-                context.disallow_interruptions()
-            except Exception as e:
-                logger.warning(f"disallow_interruptions failed (continuing): {e}")
+            # Disable interruptions if we have a tool context. Only valid for
+            # the LLM-tool path; silence path doesn't have one.
+            if context is not None:
+                try:
+                    context.disallow_interruptions()
+                except Exception as e:
+                    logger.warning(f"disallow_interruptions failed (continuing): {e}")
 
-            session: AgentSession = context.session
             room: rtc.Room | None = None
             if self._ctx is not None:
                 room = getattr(self._ctx, "room", None)
@@ -526,31 +566,36 @@ class VTAAgent(Agent):
 
             # Step 1 — log to the Railway server (Retell-compatible contract).
             try:
-                await log_verification_to_server(self._phone, status, summary, full_name, http=self._http)
+                await log_verification_to_server(
+                    self._phone, status, summary, full_name, http=self._http
+                )
             except Exception as e:
                 logger.error(f"log_verification_to_server failed; continuing: {e}")
-            logger.info(f"[END_CALL_TIMING] log_to_server +{(time.monotonic()-tool_t0)*1000:.1f}ms")
+            logger.info(
+                f"[END_CALL_TIMING] log_to_server +{(time.monotonic()-tool_t0)*1000:.1f}ms"
+            )
 
-            # Step 2 — drain any speech already in flight.
-            try:
-                await context.wait_for_playout()
-            except Exception as e:
-                logger.warning(f"wait_for_playout (pre-closing) failed: {e}")
+            # Step 2 — drain any speech already in flight (LLM mid-sentence).
+            if context is not None:
+                try:
+                    await context.wait_for_playout()
+                except Exception as e:
+                    logger.warning(f"wait_for_playout (pre-closing) failed: {e}")
 
             # Step 3 — speak the verbatim closing through the Realtime model.
-            # We use generate_reply with strict verbatim instructions because
-            # Realtime models route ALL audio output through their internal
-            # pipeline; session.say with no separate TTS configured falls
-            # back to the realtime model anyway.
+            # generate_reply with strict instructions; reasoning model follows
+            # verbatim. allow_interruptions=False on the SpeechHandle so the
+            # caller can't talk over their own closing.
             spoke_ok = False
             speak_t0 = time.monotonic()
             try:
                 speech_handle = await session.generate_reply(
                     instructions=(
-                        "Speak the following text VERBATIM, exactly word-for-word. "
-                        "Do NOT add, remove, summarize, paraphrase, or change anything. "
-                        "Speak in a warm, polite tone, then stop:\n\n"
-                        f'"{closing}"'
+                        "Speak the closing line below EXACTLY as written, "
+                        "word-for-word, in a warm professional tone, then stop. "
+                        "Do not add, remove, summarize, paraphrase, or rephrase "
+                        "anything. Do not say goodbye after — this IS the goodbye.\n\n"
+                        f"CLOSING LINE:\n{closing}"
                     ),
                 )
                 if speech_handle is not None and hasattr(speech_handle, "wait_for_playout"):
@@ -560,12 +605,13 @@ class VTAAgent(Agent):
                 logger.error(f"generate_reply closing failed ({status}): {e}")
 
             if not spoke_ok:
-                # Fallback timing estimate (~14 chars/sec TTS rate).
                 try:
                     await asyncio.sleep(max(3.0, len(closing) / 14.0))
                 except Exception:
                     pass
-            logger.info(f"[END_CALL_TIMING] closing_spoken +{(time.monotonic()-speak_t0)*1000:.1f}ms")
+            logger.info(
+                f"[END_CALL_TIMING] closing_spoken +{(time.monotonic()-speak_t0)*1000:.1f}ms"
+            )
 
             # Step 4 — notify the Railway server the call ended.
             if not self._call_end_notified:
@@ -575,7 +621,7 @@ class VTAAgent(Agent):
                         phone=self._phone,
                         call_id=room_name,
                         duration_ms=duration_ms,
-                        disconnection_reason=f"agent_end_call:{status}",
+                        disconnection_reason=f"agent_end_call:{status}:{trigger}",
                         http=self._http,
                     )
                 except Exception as e:
@@ -601,7 +647,7 @@ class VTAAgent(Agent):
                     )
                     removed_ok = True
                     logger.info(
-                        f"[END_CALL] status={status} phone={self._phone} "
+                        f"[END_CALL] done trigger={trigger} status={status} phone={self._phone} "
                         f"room={room_name} sip_identity={sip_identity} "
                         f"tcn_http={tcn_http_code_for_status(status)} "
                         f"total={(time.monotonic()-tool_t0)*1000:.1f}ms "
@@ -633,10 +679,8 @@ class VTAAgent(Agent):
                             except Exception as e2:
                                 logger.error(f"[END_CALL] room.disconnect last-resort failed: {e2}")
 
-            return None
-
         except Exception as fatal:
-            logger.exception(f"[END_CALL] FATAL in log_verification: {fatal}")
+            logger.exception(f"[END_CALL] FATAL in _end_call: {fatal}")
             try:
                 if self._ctx is not None:
                     fallback_room = getattr(self._ctx, "room", None)
@@ -653,7 +697,39 @@ class VTAAgent(Agent):
                             logger.error(f"[END_CALL] FATAL-path delete_room failed: {e}")
             except Exception as e:
                 logger.error(f"[END_CALL] FATAL-path shield itself failed: {e}")
-            return None
+
+    @function_tool()
+    async def log_verification(
+        self,
+        context: RunContext,
+        status: str,
+        summary: str,
+        full_name: str,
+    ) -> None:
+        """Log the terminal call outcome AND end the call.
+
+        Call this exactly ONCE per call, at the terminal point of the
+        conversation. After you call this tool, you must speak the closing
+        line that the system instructs you to (verbatim) and then stop —
+        this tool will then tear down the SIP leg so the call ends cleanly
+        and TCN routes the customer onward.
+
+        Args:
+            status: The verification outcome. Must be one of:
+                "verified", "wrong_number", "third_party_end",
+                "consumer_busy_end", "dnc", "customer_wants_human", "other"
+            summary: Brief one-line description of what happened during the call.
+            full_name: The customer's name.
+        """
+        await self._end_call(
+            status=status,
+            summary=summary,
+            full_name=full_name,
+            session=context.session,
+            context=context,
+            trigger="tool",
+        )
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -837,14 +913,18 @@ async def entrypoint(ctx: agents.JobContext):
             customer_info_task = None
         timeline.mark("customer info fetch fired (async)")
 
-        # Build Grok Realtime model. Constructor is cheap — actual WS connection
-        # to wss://api.x.ai/v1/realtime opens during session.start.
-        # Use the runtime-resolved key (xai_api_key) — the old module-level
-        # XAI_API_KEY constant has been removed because it would freeze a
-        # stale value at import time across spawn-subprocess boundaries.
-        rt_model = xai_realtime.RealtimeModel(
-            voice=GROK_VOICE,
+        # Build Grok Realtime model — grok-voice-think-fast-1.0 (reasoning).
+        # We use the openai-plugin Realtime client directly, NOT the xai
+        # plugin's wrapper, because the wrapper hardcodes the older
+        # non-reasoning model. The protocol is OpenAI-Realtime-spec-compatible
+        # so this just works pointed at the xAI base URL.
+        rt_model = openai_plugin.realtime.RealtimeModel(
+            base_url=GROK_REALTIME_BASE_URL,
+            model=GROK_REALTIME_MODEL,
             api_key=xai_api_key,
+            voice=GROK_VOICE,
+            temperature=GROK_TEMPERATURE,
+            modalities=["audio"],
         )
         timeline.mark("realtime model constructed")
 
@@ -884,6 +964,10 @@ async def entrypoint(ctx: agents.JobContext):
             preemptive_generation=PREEMPTIVE_GENERATION,
             min_endpointing_delay=MIN_ENDPOINTING_DELAY,
             max_endpointing_delay=MAX_ENDPOINTING_DELAY,
+            # Silence handling — after this many seconds with no user audio,
+            # AgentSession emits user_state_changed -> "away". Our handler
+            # below prompts "Are you still there?" and starts a hangup timer.
+            user_away_timeout=USER_AWAY_TIMEOUT,
         )
 
         # Observability: log per-turn latency from the model itself.
@@ -907,6 +991,97 @@ async def entrypoint(ctx: agents.JobContext):
                 logger.info(" ".join(parts))
             except Exception as e:
                 logger.warning(f"metrics handler failed: {e}")
+
+        # ------------------------------------------------------------------
+        # Silence handling
+        #
+        # AgentSession fires user_state_changed -> "away" after
+        # USER_AWAY_TIMEOUT seconds of silence (default 10s). We:
+        #   1. Speak "Are you still there?" (once per silence episode)
+        #   2. Start a SILENCE_FOLLOWUP_DELAY task (default 50s)
+        #   3. If user comes back, cancel the task + reset the warning latch
+        #   4. If task fires, end the call cleanly via _end_call("other")
+        #      so TCN sees the same BYE pattern as a normal hangup.
+        # ------------------------------------------------------------------
+        silence_state: dict[str, object] = {
+            "warning_said": False,
+            "hangup_task": None,
+        }
+
+        async def _silence_hangup_after(delay: float) -> None:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                logger.info("[SILENCE] hangup task cancelled — user came back")
+                return
+            # Still silent. Re-check the latest state to avoid race with a
+            # last-millisecond user_state transition.
+            current_state = getattr(session, "user_state", "listening")
+            if current_state != "away":
+                logger.info(
+                    f"[SILENCE] hangup fire suppressed — user_state={current_state}"
+                )
+                return
+            if vta_agent._ending:
+                logger.info("[SILENCE] hangup fire suppressed — already ending")
+                return
+            logger.info(
+                f"[SILENCE] {SILENCE_TOTAL_SECONDS}s total silence — "
+                "invoking _end_call(status=other) for TCN-clean hangup"
+            )
+            await vta_agent._end_call(
+                status="other",
+                summary=f"Call ended — caller silent for {int(SILENCE_TOTAL_SECONDS)}s after agent finished speaking",
+                full_name=vta_agent._full_name or "the customer",
+                session=session,
+                context=None,
+                trigger="silence_timeout",
+            )
+
+        @session.on("user_state_changed")
+        def on_user_state(ev) -> None:
+            try:
+                # Don't engage silence path if we're already winding down.
+                if vta_agent._ending:
+                    return
+                new_state = getattr(ev, "new_state", None)
+                if new_state == "away":
+                    if silence_state["warning_said"]:
+                        # Already prompted in this silence episode — let the
+                        # hangup task run to completion. (User briefly came
+                        # back and went silent again is extremely rare in
+                        # practice and would just re-arm via the listening
+                        # branch below.)
+                        return
+                    silence_state["warning_said"] = True
+                    logger.info(
+                        f"[SILENCE] user_state -> away after {USER_AWAY_TIMEOUT}s; "
+                        "prompting and starting hangup timer"
+                    )
+                    # Speak the prompt — using session.say (not generate_reply)
+                    # so the LLM doesn't decide to ad-lib something else.
+                    try:
+                        session.say(SILENCE_PROMPT_TEXT, allow_interruptions=True)
+                    except Exception as e:
+                        logger.warning(f"[SILENCE] session.say(prompt) failed: {e}")
+                    # Schedule the hangup
+                    silence_state["hangup_task"] = asyncio.create_task(
+                        _silence_hangup_after(SILENCE_FOLLOWUP_DELAY)
+                    )
+                elif new_state in ("speaking", "listening"):
+                    # User came back. Cancel pending hangup and reset latch
+                    # so a future silence episode re-prompts cleanly.
+                    task = silence_state["hangup_task"]
+                    if task is not None and not task.done():
+                        task.cancel()
+                    silence_state["hangup_task"] = None
+                    if silence_state["warning_said"]:
+                        logger.info(
+                            f"[SILENCE] user_state -> {new_state}; reset"
+                        )
+                    silence_state["warning_said"] = False
+            except Exception as e:
+                logger.exception(f"[SILENCE] user_state_changed handler failed: {e}")
 
         room_options = room_io.RoomOptions(
             participant_kinds=[
@@ -965,20 +1140,28 @@ async def entrypoint(ctx: agents.JobContext):
 
         ctx.add_shutdown_callback(_cleanup)
 
-        # Trigger the opening line. With Realtime, this is a generate_reply
-        # with the verbatim opening as the instruction.
+        # Trigger the opening line. The opening text is hardcoded
+        # (OPENING_LINE_TEMPLATE) — the LLM cannot rewrite it because it
+        # never sees a separate file or prompt for it. With reasoning
+        # Realtime + verbatim instructions, this plays as written.
         full_name = customer_info.get("full_name", "the customer")
-        opening = load_prompt("opening_line.md").format(full_name=full_name)
+        opening = OPENING_LINE_TEMPLATE.format(full_name=full_name)
         await session.generate_reply(
             instructions=(
-                "Speak the following greeting VERBATIM, exactly word-for-word, "
-                "in a warm, polite tone, then stop and wait for the caller's reply:\n\n"
-                f'"{opening}"'
+                "Speak the following opening line EXACTLY as written, "
+                "word-for-word, in a warm professional tone, then stop and "
+                "wait silently for the caller's reply. Do not add a preamble, "
+                "do not greet in any other way, do not ask anything else.\n\n"
+                f"OPENING LINE:\n{opening}"
             ),
         )
         timeline.mark("opening reply queued")
 
-        logger.info(f"VTA agent started for {phone} ({full_name}) using Grok Realtime ({GROK_VOICE})")
+        logger.info(
+            f"VTA agent started for {phone} ({full_name}) using "
+            f"{GROK_REALTIME_MODEL} (voice={GROK_VOICE}, "
+            f"silence={USER_AWAY_TIMEOUT}s/{SILENCE_TOTAL_SECONDS}s)"
+        )
 
     except Exception:
         # Make sure http session is closed on early failure.
