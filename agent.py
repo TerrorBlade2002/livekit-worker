@@ -653,17 +653,41 @@ async def entrypoint(ctx: agents.JobContext):
     """
     timeline = Timeline(ctx.room.name or "unknown")
 
-    if XAI_API_KEY is None:
-        logger.error("XAI_API_KEY (or GROK_API_KEY) is not set — agent cannot start")
+    # CONNECT FIRST. Always join the room before doing anything else so:
+    #  (a) the agent visibly appears in agent console / playground / SIP room
+    #      even if downstream setup blows up, which makes failures much
+    #      easier to debug than a silent no-show.
+    #  (b) the LiveKit job is acknowledged — without ctx.connect() the
+    #      worker holds the job slot but never actually joins, which looks
+    #      identical to "agent isn't running" from the user's side.
+    try:
+        await ctx.connect()
+    except Exception as e:
+        logger.exception(f"ctx.connect() failed — cannot proceed: {e}")
         return
+    timeline.mark("ctx.connect done")
 
     # Shared HTTP session — saves TLS+connection-setup on every Railway call (~50-150ms).
     http_session = aiohttp.ClientSession()
     timeline.mark("http session up")
 
+    if not XAI_API_KEY:
+        # Loud, visible failure path. We're already in the room so the user
+        # can see the agent joined; the error explains why nothing else happens.
+        logger.error(
+            "=" * 70 + "\n"
+            "  XAI_API_KEY is NOT SET. Grok Realtime cannot connect.\n"
+            "  Set XAI_API_KEY (or GROK_API_KEY) in your .env or Railway env vars.\n"
+            "  Get a key from https://console.x.ai/\n"
+            + "=" * 70
+        )
+        try:
+            await http_session.close()
+        except Exception:
+            pass
+        return
+
     try:
-        await ctx.connect()
-        timeline.mark("ctx.connect done")
 
         phone = ""
         sip_identity = ""
@@ -889,10 +913,36 @@ async def entrypoint(ctx: agents.JobContext):
 
 
 if __name__ == "__main__":
+    # `agent_name` puts the worker in EXPLICIT DISPATCH mode — only jobs
+    # that explicitly target "vta-emma" land here. That's required for
+    # production (TCN's SIP dispatch rule names this agent) but it BREAKS
+    # agent console / playground, which create rooms and expect any worker
+    # to auto-join.
+    #
+    # Escape hatch: when running `python agent.py dev`, drop the agent_name
+    # so the worker auto-dispatches into any new room (including playground
+    # rooms). For `python agent.py start` (production), keep the explicit
+    # name. You can also force the dev behavior in any mode by setting
+    # AGENT_AUTO_DISPATCH=true in the env.
+    import sys as _sys
+
+    _is_dev_mode = (
+        len(_sys.argv) > 1 and _sys.argv[1] == "dev"
+    ) or os.getenv("AGENT_AUTO_DISPATCH", "").lower() == "true"
+
+    _agent_name = "" if _is_dev_mode else "vta-emma"
+    if _is_dev_mode:
+        logger.info(
+            "[BOOT] dev mode detected — running with agent_name='' so the "
+            "worker auto-dispatches into any new room (agent console / playground will work)"
+        )
+    else:
+        logger.info(f"[BOOT] production mode — explicit dispatch only: agent_name='{_agent_name}'")
+
     agents.cli.run_app(
         agents.WorkerOptions(
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm,
-            agent_name="vta-emma",
+            agent_name=_agent_name,
         )
     )
