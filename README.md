@@ -8,30 +8,34 @@ Do not merge them into one deploy unless you intentionally want a combined archi
 ## What this worker does
 - Connects to LiveKit Cloud as agent `vta-emma`
 - Handles inbound SIP-dispatched calls
-- Runs **xAI Grok Realtime** end-to-end (single STT+LLM+TTS model — see below)
+- Runs **cascaded xAI Grok pipeline** (STT + reasoning LLM + TTS, all xAI)
 - Fetches customer data from the existing Railway webhook server
 - Logs dispositions back to the same Railway server
 - Sends `call_ended` notifications before disconnecting
 
-## Pipeline (Grok Realtime — switched from cascaded)
+## Pipeline (cascaded Grok — switched from Realtime)
 
-| Stage | Provider | Default                          | Override env             |
-| ----- | -------- | -------------------------------- | ------------------------ |
-| Voice | xAI      | `grok-4-1-fast-non-reasoning`    | (hardcoded by xai plugin) |
-| Voice (TTS) | xAI | `Ara` (female)                  | `GROK_VOICE` (`Ara`, `Eve`, `Leo`, `Rex`, `Sal`) |
-| VAD   | Server-side (xAI Realtime) | —                  | —                        |
+| Stage | Provider | Default                       | Override env             |
+| ----- | -------- | ----------------------------- | ------------------------ |
+| STT   | xAI      | `en` (English-pinned)         | —                        |
+| LLM   | xAI      | `grok-4-fast-reasoning`       | `XAI_LLM_MODEL`, `XAI_REASONING_EFFORT`, `XAI_LLM_TEMPERATURE` |
+| TTS   | xAI      | `ara` (female)                | `GROK_VOICE` (`ara`, `eve`, `leo`, `rex`, `sal`) |
+| VAD   | Silero   | (loaded via `prewarm_fnc`)    | —                        |
 
-**Why end-to-end Realtime instead of cascaded:**
-- One model handles STT + LLM + TTS, collapsing per-turn latency from
-  ~1-2s aggregate (cascaded) to ~300-600ms TTFT (Realtime).
-- Single API key (`XAI_API_KEY`) instead of three.
-- Server-side VAD — no Silero load on the worker.
+**Why cascaded with reasoning instead of Realtime:**
+- Realtime exposes only `grok-4-1-fast-non-reasoning` — no chain-of-thought.
+  On a long branchy verification prompt (7 end-call statuses), it would
+  unreliably call `log_verification` or paraphrase the closing line, which
+  broke production handoffs to TCN.
+- Chat-completions API supports rigid OpenAI-compatible function calling.
+- Reasoning lets the model PLAN the right tool call before speaking.
+- Standalone TTS (`xai.TTS`) speaks **literal text** — guaranteed verbatim
+  closings, impossible to paraphrase.
+- Still single `XAI_API_KEY`.
 
-**Trade-off — no chain-of-thought:** the xAI Realtime API currently exposes
-only `grok-4-1-fast-non-reasoning`. If you need explicit reasoning for a
-particularly tricky branch in the system prompt, switch back to cascaded
-with `LLM.with_x_ai(model="grok-4-1-fast-reasoning")` — costs ~300-600ms
-extra TTFT per turn but does chain-of-thought.
+**Latency cost:** ~300-500ms higher TTFT per turn vs Realtime. For a
+verification call where any missed `log_verification` is a customer routed
+wrong, that trade is worth it.
 
 ## Latency engineering
 
@@ -40,17 +44,17 @@ Every stage of the linkback path is timed and logged. Grep Railway logs for
 
 ```
 [TTFT:vta-call-...] +    0.0ms (total=    0.0ms)  __start__
-[TTFT:vta-call-...] +    1.2ms (total=    1.2ms)  http session up
-[TTFT:vta-call-...] +   89.4ms (total=   90.6ms)  ctx.connect done
+[TTFT:vta-call-...] +   89.4ms (total=   89.4ms)  ctx.connect done
+[TTFT:vta-call-...] +    1.2ms (total=   90.6ms)  http session up
 [TTFT:vta-call-...] +  142.1ms (total=  232.7ms)  SIP participant resolved
-[TTFT:vta-call-...] +    0.3ms (total=  233.0ms)  customer info fetch fired (async)
-[TTFT:vta-call-...] +    0.8ms (total=  233.8ms)  realtime model constructed
-[TTFT:vta-call-...] +  187.6ms (total=  421.4ms)  customer info ready
-[TTFT:vta-call-...] +    0.5ms (total=  421.9ms)  agent constructed
-[TTFT:vta-call-...] +  312.0ms (total=  733.9ms)  session.start done (Grok WS connected)
-[TTFT:vta-call-...] +   18.4ms (total=  752.3ms)  background audio started
-[TTFT:vta-call-...] +    1.1ms (total=  753.4ms)  opening reply queued
-[METRICS:RealtimeModelMetrics] ttft=421.0ms duration=2840.2ms req=...
+[TTFT:vta-call-...] +    2.1ms (total=  234.8ms)  customer info fetch fired (async)
+[TTFT:vta-call-...] +    1.8ms (total=  236.6ms)  cascaded pipeline constructed
+[TTFT:vta-call-...] +  187.6ms (total=  424.2ms)  customer info ready
+[TTFT:vta-call-...] +  312.0ms (total=  736.2ms)  session.start done
+[TTFT:vta-call-...] +    0.5ms (total=  736.7ms)  opening line spoken
+[METRICS:STTMetrics] duration=...ms
+[METRICS:LLMMetrics] ttft=421.0ms duration=2840.2ms
+[METRICS:TTSMetrics] ttft=180.0ms duration=2200.0ms
 ```
 
 Knobs we tune for low TTFT (all overridable via env):
@@ -59,32 +63,46 @@ Knobs we tune for low TTFT (all overridable via env):
   TTFT win.**
 - `PREEMPTIVE_GENERATION=true` — LLM starts composing before user's turn
   fully ends. **Mid-call latency win** (200-500ms per turn).
+- `XAI_REASONING_EFFORT=low` — Grok thinks just enough to plan tool calls,
+  no longer.
 - `MIN_ENDPOINTING_DELAY=0.4` / `MAX_ENDPOINTING_DELAY=3.0` — tune turn-end
   detection sensitivity.
-- Customer info fetch is **fired in parallel** with model setup (was
-  sequential, blocking ~200ms).
+- Customer info fetch is **fired in parallel** with model setup.
 - Persistent `aiohttp.ClientSession` shared across Railway calls — saves
   TLS handshake on every request (~50-150ms each).
-- SIP participant wait shortened from 30s to 10s (TCN INVITE arrives in
-  <1s in normal operation).
-- `prewarm_fnc` registered on `WorkerOptions` — runs once per worker process,
-  not per call.
+- SIP participant wait shortened from 30s to 10s.
+- `prewarm_fnc` registered on `WorkerOptions` — loads Silero VAD ONCE per
+  worker process, not per call.
+
+## Tool-call rigidity
+
+The system prompt is hardened with explicit, concrete tool-call examples
+(see [config/system_prompt.md](config/system_prompt.md) — the
+"Terminal Tool Rule" section). Combined with `reasoning_effort` and
+`tool_choice="auto"` on the LLM and `parallel_tool_calls=False`
+(log_verification is single & terminal — never parallel), this gives
+reliable adherence:
+
+- The opening line is **hardcoded** in `agent.py` and spoken via
+  `session.say()` straight to TTS — the LLM never touches it, can't paraphrase.
+- The closing line is in `CLOSING_MESSAGES` dict, spoken via `session.say()`
+  inside `log_verification` — same guarantee.
+- The LLM only owns the conversation in between.
 
 ## End-call behavior
 
 `log_verification` is the single terminal tool. When called it:
 1. Logs the disposition to Railway server (`/log-verification`)
 2. Drains any in-flight speech (`context.wait_for_playout()`)
-3. Speaks the **deterministic verbatim closing** via `generate_reply` with
-   strict instructions
+3. Speaks the **deterministic verbatim closing** via `session.say()` (TTS-only,
+   no LLM)
 4. Notifies Railway (`/retell-call-ended`)
 5. Removes ONLY the SIP participant (`api.room.remove_participant`) — sends
    clean `disconnect_reason=PARTICIPANT_REMOVED` BYE on TCN's leg B
 6. TCN sees clean BYE → fires Action OK → Data Dip → Hunt Group
 
 Wrapped in an outer try/except shield so the tool never raises an exception
-back to the LLM (which would cause "An internal error has occurred"
-ad-libbing in the customer's ear).
+back to the LLM.
 
 ## Existing Railway server used by this worker
 - `/retell-webhook`
@@ -95,8 +113,7 @@ ad-libbing in the customer's ear).
 - [agent.py](agent.py)
 - [setup_sip.py](setup_sip.py)
 - [requirements.txt](requirements.txt)
-- [config/system_prompt.md](config/system_prompt.md)
-- [config/opening_line.md](config/opening_line.md)
+- [config/system_prompt.md](config/system_prompt.md) — hardened with explicit tool-call examples
 
 ## Environment variables
 Copy [.env.example](.env.example) to `.env` and set:
@@ -105,40 +122,51 @@ Required:
 - `LIVEKIT_URL`
 - `LIVEKIT_API_KEY`
 - `LIVEKIT_API_SECRET`
-- `XAI_API_KEY` — used for Grok Realtime (STT+LLM+TTS in one model)
+- `XAI_API_KEY` — single key for STT + LLM + TTS
 - `RAILWAY_SERVER_URL`
 
 Optional (sensible defaults — only set to override):
-- `GROK_VOICE` (default `Ara` — also `Eve`, `Leo`, `Rex`, `Sal`)
+- `XAI_LLM_MODEL` (default `grok-4-fast-reasoning`)
+- `XAI_REASONING_EFFORT` (default `low`)
+- `XAI_LLM_TEMPERATURE` (default `0.3`)
+- `GROK_VOICE` (default `ara` — also `eve`, `leo`, `rex`, `sal`)
 - `AEC_WARMUP_DURATION` (default `0` — leave at 0 for SIP)
 - `PREEMPTIVE_GENERATION` (default `true`)
 - `MIN_ENDPOINTING_DELAY` (default `0.4`)
 - `MAX_ENDPOINTING_DELAY` (default `3.0`)
 
 ## Local run
-- `pip install -r requirements.txt`
-- `python agent.py start`
 
-For local testing, use:
-- `python agent.py dev`
+Using `pip`:
+```
+pip install -r requirements.txt
+python agent.py dev      # auto-dispatches to any room (agent console works)
+python agent.py start    # production mode (explicit dispatch only)
+```
+
+Using `uv`:
+```
+uv add "livekit-agents[openai,xai]~=1.4" "livekit-plugins-silero~=1.4" \
+       livekit-api python-dotenv aiohttp
+uv run python agent.py dev
+```
 
 ## Railway deploy
-Same Railway service as before — just pushes this repo. After deploy:
-- Confirm `XAI_API_KEY` is set in Railway env vars
-- Old `OPENAI_API_KEY` / `GEMINI_API_KEY` can be removed (no longer used by
-  the Realtime path; keep them only if you might switch back to cascaded)
-- Old `OPENAI_LLM_MODEL`, `OPENAI_STT_MODEL`, `GEMINI_TTS_MODEL` env vars
-  are unused on the Realtime path
+- Source repo: this worker repo only
+- Start command: `python agent.py start`
+- Variables: at minimum `XAI_API_KEY`, `LIVEKIT_*`, `RAILWAY_SERVER_URL`
+- Old `OPENAI_API_KEY`, `GEMINI_API_KEY` env vars can be removed.
 
 ## Observability quick reference
 
 | Log prefix         | What it tells you                                          |
 | ------------------ | ---------------------------------------------------------- |
-| `[TTFT:<room>]`    | Per-stage wall clock from entrypoint to opening reply      |
-| `[METRICS:...]`    | Per-turn model metrics (ttft, duration) emitted live       |
-| `[END_CALL]`       | Final hangup result + SIP identity removed                 |
+| `[BOOT]`           | One-time startup info (.env path, dispatch mode)           |
+| `[PREWARM]`        | One-time-per-process worker init (vad loaded, key present) |
+| `[TTFT:<room>]`    | Per-stage wall clock from entrypoint to opening line       |
+| `[METRICS:...]`    | Per-turn pipeline metrics (STT/LLM/TTS/EOU ttft+duration)  |
+| `[END_CALL]`       | Final hangup result + total time + SIP identity removed    |
 | `[END_CALL_TIMING]`| Per-step timing inside `log_verification`                  |
-| `[PREWARM]`        | One-time-per-process worker init                           |
 
 ## Important
 The existing webhook repo should continue to own only the Node webhook server in [retell-vta-webhook/retell-vta-webhook](../retell-vta-webhook/retell-vta-webhook).

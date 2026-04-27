@@ -1,6 +1,15 @@
-livekit-agents[openai,xai]>=1.5
-livekit-plugins-xai>=1.5
-livekit-plugins-openai>=1.5
+# Core LiveKit Agents — `~=1.4` allows any 1.x >= 1.4 (including 1.5.x).
+# The [xai] extra brings in livekit-plugins-xai automatically; the [openai]
+# extra is needed because LLM.with_x_ai() lives in the openai plugin (xAI's
+# chat-completions API is OpenAI-compatible).
+livekit-agents[openai,xai]~=1.4
+
+# Silero VAD — required for the cascaded pipeline's turn detection.
+# Loaded once per worker process via prewarm_fnc.
+livekit-plugins-silero~=1.4
+
+# Direct LiveKit API (room/participant management, sip dispatch helpers)
 livekit-api>=1.0
+
 python-dotenv>=1.0.0
 aiohttp>=3.9.0
