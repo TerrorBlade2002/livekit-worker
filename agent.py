@@ -22,8 +22,8 @@ from livekit.agents import (
     metrics,
 )
 from livekit.agents.voice import room_io
-from livekit.plugins import openai as openai_plugin
-from livekit.plugins import silero, xai
+from livekit.plugins import xai
+from livekit.plugins.xai import realtime as xai_realtime
 
 # ---------------------------------------------------------------------------
 # .env loading — robust against arbitrary cwd
@@ -73,41 +73,17 @@ RAILWAY_SERVER_URL = os.getenv(
 )
 
 # ---------------------------------------------------------------------------
-# Cascaded Grok pipeline (replacing Grok Realtime)
+# Grok Realtime config
 #
-# Why cascaded with reasoning instead of Realtime:
-#  - Realtime only exposes `grok-4-1-fast-non-reasoning` — no chain-of-thought,
-#    which makes complex branchy prompts (like our verification flow with 7
-#    end-call statuses) unreliable. The Realtime model would skip
-#    log_verification calls or paraphrase the closing line.
-#  - Chat-completions API supports proper OpenAI-compatible function calling
-#    semantics — much more rigid than Realtime's call_tool surface.
-#  - Reasoning gives the model space to plan the right tool call BEFORE
-#    speaking, so "did the consumer just confirm their full name?" actually
-#    gets thought through.
-#  - TTS via xai.TTS speaks LITERAL text (not LLM-routed), so closing lines
-#    are guaranteed verbatim — impossible for the model to paraphrase.
-#  - Still single XAI_API_KEY (xai STT + xai LLM + xai TTS).
-#
-# Latency cost: ~300-500ms higher TTFT per turn vs Realtime. For a
-# verification call where ANY missed log_verification is a customer routed
-# wrong, that trade is worth it.
+# We use the xAI Realtime API end-to-end (single STT+LLM+TTS model) to
+# minimise per-turn latency. Underlying model is `grok-4-1-fast-non-reasoning`
+# (hardcoded by the xai plugin's RealtimeModel as of livekit-plugins-xai 1.5.x).
+# This is NOT a chain-of-thought model — if you need reasoning, switch to the
+# cascaded path (LLM.with_x_ai(model="grok-4-1-fast-reasoning")), which costs
+# ~300-600ms more TTFT per turn.
 # ---------------------------------------------------------------------------
-# Grok LLM model. grok-4-fast-reasoning has chain-of-thought + good TTFT.
-# Other options: "grok-4" (slower, more accurate), "grok-3-mini-fast"
-# (cheaper, set reasoning_effort="high" for parity).
-XAI_LLM_MODEL = os.getenv("XAI_LLM_MODEL", "grok-4-fast-reasoning")
-# reasoning_effort: "low" (fast, less thinking), "medium", "high" (slowest,
-# best for hard branchy decisions). For verification routing, "low" is
-# enough — the model just needs to plan tool calls, not solve hard problems.
-XAI_REASONING_EFFORT = os.getenv("XAI_REASONING_EFFORT", "low")
-XAI_LLM_TEMPERATURE = float(os.getenv("XAI_LLM_TEMPERATURE", "0.3"))
-# Lower temperature = more deterministic tool calling. 0.3 is a sweet spot.
-
-# Grok voice (xai.TTS). All lowercase here — the xai TTS plugin uses
-# lowercase voice names. Options: "ara" (female), "eve" (female),
-# "leo" (male), "rex" (male), "sal" (male).
-GROK_VOICE = os.getenv("GROK_VOICE", "ara").lower()
+# Grok voices: Ara (female, default), Eve (female), Leo (male), Rex (male), Sal (male).
+GROK_VOICE = os.getenv("GROK_VOICE", "Ara")
 
 # AgentSession latency knobs — see docstrings on AgentSession for full details.
 # aec_warmup_duration default is 3.0s, which delays the opening line by
@@ -123,11 +99,6 @@ MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.4"))
 MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "3.0"))
 
 CONFIG_DIR = Path(__file__).parent / "config"
-
-# The opening line is intentionally hardcoded here (not in a template file)
-# so it's impossible for the LLM to ever rewrite it. Spoken via session.say
-# straight to xai.TTS — guaranteed verbatim.
-OPENING_LINE_TEMPLATE = "Hi, this call is for {full_name}."
 
 # Closing messages are deterministic so hangup is reliable and in Emma's
 # voice; the LLM MUST NOT speak its own goodbye. We pass them through
@@ -494,12 +465,10 @@ class VTAAgent(Agent):
     #     this room is the LiveKit-side endpoint of leg B)
     #   - LiveKit room: { SIP participant, vta-emma agent }
     #
-    # With CASCADED pipeline (xai STT + xai LLM + xai TTS), we use
-    # session.say() for the closing — it goes through the standalone TTS
-    # plugin which speaks LITERAL TEXT, no LLM in the loop. This is
-    # guaranteed verbatim. (With the old Realtime model we had to use
-    # generate_reply because the model owned the TTS pipeline; now that
-    # TTS is its own component, we get rigid verbatim closings for free.)
+    # With Realtime models, we use generate_reply(instructions=...) for the
+    # closing because session.say bypasses the model's own TTS in some
+    # configurations. generate_reply with verbatim instructions makes the
+    # Realtime model speak the exact closing through its own audio pipeline.
     # ------------------------------------------------------------------
     @function_tool()
     async def log_verification(
@@ -568,21 +537,27 @@ class VTAAgent(Agent):
             except Exception as e:
                 logger.warning(f"wait_for_playout (pre-closing) failed: {e}")
 
-            # Step 3 — speak the verbatim closing through the standalone TTS.
-            # session.say() routes the literal string straight to xai.TTS —
-            # no LLM in the loop, so the closing is GUARANTEED verbatim.
-            # CRITICAL API DETAIL: session.say() returns SpeechHandle directly
-            # (NOT a coroutine). Don't `await session.say(...)` — get the
-            # handle, then await its wait_for_playout().
+            # Step 3 — speak the verbatim closing through the Realtime model.
+            # We use generate_reply with strict verbatim instructions because
+            # Realtime models route ALL audio output through their internal
+            # pipeline; session.say with no separate TTS configured falls
+            # back to the realtime model anyway.
             spoke_ok = False
             speak_t0 = time.monotonic()
             try:
-                speech_handle = session.say(closing, allow_interruptions=False)
+                speech_handle = await session.generate_reply(
+                    instructions=(
+                        "Speak the following text VERBATIM, exactly word-for-word. "
+                        "Do NOT add, remove, summarize, paraphrase, or change anything. "
+                        "Speak in a warm, polite tone, then stop:\n\n"
+                        f'"{closing}"'
+                    ),
+                )
                 if speech_handle is not None and hasattr(speech_handle, "wait_for_playout"):
                     await speech_handle.wait_for_playout()
                 spoke_ok = True
             except Exception as e:
-                logger.error(f"session.say closing failed ({status}): {e}")
+                logger.error(f"generate_reply closing failed ({status}): {e}")
 
             if not spoke_ok:
                 # Fallback timing estimate (~14 chars/sec TTS rate).
@@ -691,35 +666,21 @@ class VTAAgent(Agent):
 def prewarm(proc: JobProcess) -> None:
     """Pre-load expensive, reusable resources before the first job arrives.
 
-    Two things happen here:
-     1. Silero VAD model is loaded into memory ONCE per worker process.
-        Loading it lazily per-call adds 200-500ms to TTFT (model file is
-        ~2MB and goes through ONNX runtime initialization). Loading here
-        means every call after the first is instant.
-     2. Re-load .env. With multiprocessing_context="spawn" (the default),
-        each job process is a fresh Python interpreter that re-imports
-        this module. The module-level load_dotenv() runs in that context —
-        but if the spawned process's cwd differs from the supervisor's,
-        a relative .env lookup would miss. We re-call load_dotenv() with
-        an explicit path here as a belt-and-braces guarantee.
+    Also re-loads .env. Reason: with multiprocessing_context="spawn" (the
+    default), each job process is a fresh Python interpreter that imports
+    this module from scratch. The module-level load_dotenv() runs in that
+    context — but if the spawned process's cwd differs from the supervisor's,
+    a relative .env lookup would miss. We re-call load_dotenv() with an
+    explicit path here as a belt-and-braces guarantee.
     """
     t0 = time.monotonic()
     load_dotenv(dotenv_path=_ENV_PATH, override=True)
-
-    # Pre-load Silero VAD — this is the slowest single thing in cold-start.
-    try:
-        proc.userdata["vad"] = silero.VAD.load()
-    except Exception as e:
-        logger.error(f"[PREWARM] silero VAD failed to load (will lazy-load per call): {e}")
-        proc.userdata["vad"] = None
-
     proc.userdata["http_session"] = None
     xai_present = bool(_resolve_xai_api_key())
     elapsed = (time.monotonic() - t0) * 1000.0
     logger.info(
         f"[PREWARM] worker process initialized in {elapsed:.1f}ms "
-        f"(env={_ENV_PATH}, exists={_ENV_PATH.exists()}, "
-        f"xai_key_loaded={xai_present}, vad_loaded={proc.userdata['vad'] is not None})"
+        f"(env={_ENV_PATH}, exists={_ENV_PATH.exists()}, xai_key_loaded={xai_present})"
     )
 
 
@@ -876,31 +837,16 @@ async def entrypoint(ctx: agents.JobContext):
             customer_info_task = None
         timeline.mark("customer info fetch fired (async)")
 
-        # Build the cascaded Grok pipeline (xai STT + xai LLM + xai TTS + Silero VAD).
-        # All three xAI components share XAI_API_KEY. Constructors are cheap —
-        # actual network connections happen on session.start / first turn.
-        stt_model = xai.STT(
-            language="en",
-            api_key=xai_api_key,
-        )
-        llm_model = openai_plugin.LLM.with_x_ai(
-            model=XAI_LLM_MODEL,
-            api_key=xai_api_key,
-            temperature=XAI_LLM_TEMPERATURE,
-            reasoning_effort=XAI_REASONING_EFFORT,
-            tool_choice="auto",
-            parallel_tool_calls=False,  # log_verification is single & terminal — never parallel
-        )
-        tts_model = xai.TTS(
+        # Build Grok Realtime model. Constructor is cheap — actual WS connection
+        # to wss://api.x.ai/v1/realtime opens during session.start.
+        # Use the runtime-resolved key (xai_api_key) — the old module-level
+        # XAI_API_KEY constant has been removed because it would freeze a
+        # stale value at import time across spawn-subprocess boundaries.
+        rt_model = xai_realtime.RealtimeModel(
             voice=GROK_VOICE,
             api_key=xai_api_key,
         )
-        # Silero VAD is loaded by `prewarm` and stashed on the proc userdata.
-        vad_model = ctx.proc.userdata.get("vad") if hasattr(ctx, "proc") else None
-        if vad_model is None:
-            # Fallback if prewarm didn't run (e.g. dev mode oddities)
-            vad_model = silero.VAD.load()
-        timeline.mark("cascaded pipeline constructed")
+        timeline.mark("realtime model constructed")
 
         # Await customer info now (will be ready by this point in most cases).
         if customer_info_task is not None:
@@ -928,10 +874,7 @@ async def entrypoint(ctx: agents.JobContext):
 
         # Build the AgentSession with Realtime LLM and explicit latency knobs.
         session = AgentSession(
-            stt=stt_model,
-            llm=llm_model,
-            tts=tts_model,
-            vad=vad_model,
+            llm=rt_model,
             # AEC warmup default is 3.0s — for SIP audio (unidirectional via
             # gateway) AEC isn't needed, so we set this to 0 to claw back ~3s
             # off the opening line TTFT.
@@ -943,10 +886,9 @@ async def entrypoint(ctx: agents.JobContext):
             max_endpointing_delay=MAX_ENDPOINTING_DELAY,
         )
 
-        # Observability: log per-turn latency from each pipeline stage.
-        # In cascaded mode we get LLMMetrics, STTMetrics, TTSMetrics, EOUMetrics —
-        # each with its own ttft/duration so we can see which stage is the
-        # bottleneck on a slow turn.
+        # Observability: log per-turn latency from the model itself.
+        # RealtimeModelMetrics has `ttft` (seconds) — that's the model's own
+        # time-to-first-token, distinct from our wall-clock end-to-end TTFT.
         @session.on("metrics_collected")
         def on_metrics(ev) -> None:
             try:
@@ -1023,36 +965,20 @@ async def entrypoint(ctx: agents.JobContext):
 
         ctx.add_shutdown_callback(_cleanup)
 
-        # Trigger the opening line. With cascaded TTS, session.say() routes
-        # the literal text directly to xai.TTS — no LLM round-trip, no chance
-        # of paraphrasing, and faster TTFT than generate_reply because we
-        # skip the LLM entirely for this deterministic greeting.
-        # CRITICAL: session.say() returns SpeechHandle directly (NOT awaitable
-        # as a coroutine). Get the handle, then await wait_for_playout() if
-        # we want to block on completion — but we DON'T block here, so the
-        # caller hears the greeting and the agent immediately starts listening.
+        # Trigger the opening line. With Realtime, this is a generate_reply
+        # with the verbatim opening as the instruction.
         full_name = customer_info.get("full_name", "the customer")
-        opening_text = OPENING_LINE_TEMPLATE.format(full_name=full_name)
-        try:
-            session.say(opening_text, allow_interruptions=False)
-        except Exception as e:
-            logger.error(f"session.say(opening) failed: {e}")
-            # Fallback to generate_reply if TTS direct path fails for any reason
-            try:
-                await session.generate_reply(
-                    instructions=(
-                        f'Greet the caller by saying EXACTLY: "{opening_text}". '
-                        "Do not add or change anything. Then wait."
-                    ),
-                )
-            except Exception as e2:
-                logger.error(f"opening fallback (generate_reply) also failed: {e2}")
-        timeline.mark("opening line spoken")
-
-        logger.info(
-            f"VTA agent started for {phone} ({full_name}) "
-            f"using cascaded Grok ({XAI_LLM_MODEL}, voice={GROK_VOICE})"
+        opening = load_prompt("opening_line.md").format(full_name=full_name)
+        await session.generate_reply(
+            instructions=(
+                "Speak the following greeting VERBATIM, exactly word-for-word, "
+                "in a warm, polite tone, then stop and wait for the caller's reply:\n\n"
+                f'"{opening}"'
+            ),
         )
+        timeline.mark("opening reply queued")
+
+        logger.info(f"VTA agent started for {phone} ({full_name}) using Grok Realtime ({GROK_VOICE})")
 
     except Exception:
         # Make sure http session is closed on early failure.
