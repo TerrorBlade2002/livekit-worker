@@ -24,10 +24,48 @@ from livekit.agents import (
 from livekit.agents.voice import room_io
 from livekit.plugins.xai import realtime as xai_realtime
 
-load_dotenv()
+# ---------------------------------------------------------------------------
+# .env loading — robust against arbitrary cwd
+#
+# load_dotenv() with no arguments looks at the CURRENT WORKING DIRECTORY (and
+# walks up). That's fragile for two reasons:
+#  1) If you launch the worker from any directory other than livekit-worker/
+#     (e.g. cd .. && python livekit-worker/agent.py), .env isn't found.
+#  2) LiveKit's job-process spawn (`multiprocessing_context="spawn"`)
+#     re-imports this module in a fresh subprocess. Depending on the OS
+#     and how spawn is configured, the child's cwd may not match the
+#     parent's, so a .env that loaded fine in the supervisor may NOT load
+#     in the spawned job process.
+#
+# Fix: pin the search to the .env that lives next to this file.
+# Override=True so a child process picks up any later changes.
+# ---------------------------------------------------------------------------
+_ENV_PATH = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=_ENV_PATH, override=True)
 
 logger = logging.getLogger("vta-agent")
 logger.setLevel(logging.INFO)
+
+# Surface where we tried to load .env from — useful when debugging
+# "key not loaded" issues across spawn/Docker/Railway boundaries.
+logger.info(
+    f"[BOOT] .env path: {_ENV_PATH} (exists={_ENV_PATH.exists()})"
+)
+
+
+def _resolve_xai_api_key() -> str | None:
+    """Read XAI_API_KEY (or GROK_API_KEY) at call time, not at import time.
+
+    Reading at call time is important because:
+     - In dev, you might edit .env between worker restarts; load_dotenv
+       runs again at module import, but only if the module is re-imported.
+     - In subprocess spawn, the env is re-loaded but anyone who captured
+       it into a module-level constant would still hold the OLD value.
+
+    Returns the key (str) or None if neither var is set.
+    """
+    return os.getenv("XAI_API_KEY") or os.getenv("GROK_API_KEY")
+
 
 RAILWAY_SERVER_URL = os.getenv(
     "RAILWAY_SERVER_URL", "https://virtual-transfer-agent-production.up.railway.app"
@@ -43,7 +81,6 @@ RAILWAY_SERVER_URL = os.getenv(
 # cascaded path (LLM.with_x_ai(model="grok-4-1-fast-reasoning")), which costs
 # ~300-600ms more TTFT per turn.
 # ---------------------------------------------------------------------------
-XAI_API_KEY = os.getenv("XAI_API_KEY") or os.getenv("GROK_API_KEY")
 # Grok voices: Ara (female, default), Eve (female), Leo (male), Rex (male), Sal (male).
 GROK_VOICE = os.getenv("GROK_VOICE", "Ara")
 
@@ -626,16 +663,24 @@ class VTAAgent(Agent):
 # to Railway aren't re-established cold.
 # ---------------------------------------------------------------------------
 def prewarm(proc: JobProcess) -> None:
-    """Pre-load expensive, reusable resources before the first job arrives."""
+    """Pre-load expensive, reusable resources before the first job arrives.
+
+    Also re-loads .env. Reason: with multiprocessing_context="spawn" (the
+    default), each job process is a fresh Python interpreter that imports
+    this module from scratch. The module-level load_dotenv() runs in that
+    context — but if the spawned process's cwd differs from the supervisor's,
+    a relative .env lookup would miss. We re-call load_dotenv() with an
+    explicit path here as a belt-and-braces guarantee.
+    """
     t0 = time.monotonic()
-    # Persistent HTTP session — TLS handshake is one-time-paid, connections are pooled.
-    # The actual session is created lazily in entrypoint because aiohttp insists
-    # the session live in an asyncio loop (and prewarm runs synchronously).
+    load_dotenv(dotenv_path=_ENV_PATH, override=True)
     proc.userdata["http_session"] = None
-    # Pre-resolve XAI / Railway DNS by doing a tiny TCP probe? Not necessary —
-    # connections are pooled inside the loop in any case.
+    xai_present = bool(_resolve_xai_api_key())
     elapsed = (time.monotonic() - t0) * 1000.0
-    logger.info(f"[PREWARM] worker process initialized in {elapsed:.1f}ms")
+    logger.info(
+        f"[PREWARM] worker process initialized in {elapsed:.1f}ms "
+        f"(env={_ENV_PATH}, exists={_ENV_PATH.exists()}, xai_key_loaded={xai_present})"
+    )
 
 
 async def entrypoint(ctx: agents.JobContext):
@@ -671,12 +716,22 @@ async def entrypoint(ctx: agents.JobContext):
     http_session = aiohttp.ClientSession()
     timeline.mark("http session up")
 
-    if not XAI_API_KEY:
+    # Re-read .env at job time (cheap) and re-resolve the key. This protects
+    # against the spawn-subprocess case where a stale module-level constant
+    # would hold None even though the env var IS set in the spawned process's
+    # environment after a re-load.
+    load_dotenv(dotenv_path=_ENV_PATH, override=True)
+    xai_api_key = _resolve_xai_api_key()
+
+    if not xai_api_key:
         # Loud, visible failure path. We're already in the room so the user
         # can see the agent joined; the error explains why nothing else happens.
         logger.error(
-            "=" * 70 + "\n"
+            "\n" + "=" * 70 + "\n"
             "  XAI_API_KEY is NOT SET. Grok Realtime cannot connect.\n"
+            f"  Tried to load .env from: {_ENV_PATH}\n"
+            f"  .env exists at that path: {_ENV_PATH.exists()}\n"
+            f"  cwd: {os.getcwd()}\n"
             "  Set XAI_API_KEY (or GROK_API_KEY) in your .env or Railway env vars.\n"
             "  Get a key from https://console.x.ai/\n"
             + "=" * 70
@@ -765,9 +820,12 @@ async def entrypoint(ctx: agents.JobContext):
 
         # Build Grok Realtime model. Constructor is cheap — actual WS connection
         # to wss://api.x.ai/v1/realtime opens during session.start.
+        # Use the runtime-resolved key (xai_api_key) — the old module-level
+        # XAI_API_KEY constant has been removed because it would freeze a
+        # stale value at import time across spawn-subprocess boundaries.
         rt_model = xai_realtime.RealtimeModel(
             voice=GROK_VOICE,
-            api_key=XAI_API_KEY,
+            api_key=xai_api_key,
         )
         timeline.mark("realtime model constructed")
 
