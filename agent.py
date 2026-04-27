@@ -726,14 +726,32 @@ async def entrypoint(ctx: agents.JobContext):
     if not xai_api_key:
         # Loud, visible failure path. We're already in the room so the user
         # can see the agent joined; the error explains why nothing else happens.
+        # We also dump (a) any env var whose name looks XAI-related to catch
+        # typos like XAI_KEY / XAIAPIKEY / GROK_KEY, and (b) which platform
+        # we appear to be on, so the fix is one log line away.
+        related_env = {
+            k: ("<set,len=" + str(len(v)) + ">") if v else "<empty>"
+            for k, v in os.environ.items()
+            if any(needle in k.upper() for needle in ("XAI", "GROK", "X_AI"))
+        }
+        platform_hint = (
+            "Railway / container" if os.getcwd().startswith(("/app", "/workspace")) else "local dev"
+        )
         logger.error(
             "\n" + "=" * 70 + "\n"
             "  XAI_API_KEY is NOT SET. Grok Realtime cannot connect.\n"
+            f"  Platform appears to be: {platform_hint}\n"
+            f"  cwd: {os.getcwd()}\n"
             f"  Tried to load .env from: {_ENV_PATH}\n"
             f"  .env exists at that path: {_ENV_PATH.exists()}\n"
-            f"  cwd: {os.getcwd()}\n"
-            "  Set XAI_API_KEY (or GROK_API_KEY) in your .env or Railway env vars.\n"
-            "  Get a key from https://console.x.ai/\n"
+            f"  XAI/GROK-related env vars present: {related_env or '<none>'}\n"
+            "\n"
+            "  -> If on Railway/container: .env files are NOT used in production.\n"
+            "     Set XAI_API_KEY in Railway's Variables tab in the dashboard,\n"
+            "     then redeploy. Your LOCAL .env is gitignored and is not uploaded.\n"
+            "\n"
+            "  -> If on local dev: add XAI_API_KEY=<key> to livekit-worker/.env\n"
+            "     and restart the worker. Get a key from https://console.x.ai/\n"
             + "=" * 70
         )
         try:
