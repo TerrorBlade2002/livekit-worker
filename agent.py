@@ -23,6 +23,7 @@ from livekit.agents import (
 )
 from livekit.agents.voice import room_io
 from livekit.plugins import openai as openai_plugin
+from livekit.plugins import xai as xai_plugin
 from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
 
 # ---------------------------------------------------------------------------
@@ -172,6 +173,108 @@ CLOSING_MESSAGES = {
 }
 
 TCN_TRANSFER_STATUSES = {"verified", "customer_wants_human"}
+
+
+# ---------------------------------------------------------------------------
+# Pre-synthesized closing audio cache
+#
+# THE rigid solution to "the closing line gets paraphrased / skipped".
+# We synthesize each closing line into raw rtc.AudioFrames using xai.TTS
+# ONCE per worker process, then play those exact bytes via
+# session.say(text=..., audio=<frames>) — bypassing the realtime model's
+# audio generation entirely. The model is physically incapable of
+# paraphrasing audio it didn't generate.
+#
+# Cache key is (voice, text) so re-runs with a different GROK_VOICE env
+# var don't collide. Cache lives for the lifetime of the worker process
+# (proc.userdata) — first call pays ~1-2s synth cost, every subsequent
+# call gets instant verbatim closings.
+# ---------------------------------------------------------------------------
+async def _synthesize_to_frames(
+    tts: xai_plugin.TTS, text: str
+) -> list[rtc.AudioFrame]:
+    """Run text through xai.TTS, collect into a list of AudioFrames."""
+    frames: list[rtc.AudioFrame] = []
+    stream = tts.synthesize(text)
+    try:
+        async for chunk in stream:
+            if chunk is not None and getattr(chunk, "frame", None) is not None:
+                frames.append(chunk.frame)
+    finally:
+        try:
+            await stream.aclose()
+        except Exception:
+            pass
+    return frames
+
+
+async def _frames_to_async_iter(
+    frames: list[rtc.AudioFrame],
+):
+    """Wrap a list of AudioFrames as the AsyncIterable session.say expects."""
+    for f in frames:
+        yield f
+
+
+async def get_or_build_closing_audio_cache(
+    proc_userdata: dict,
+    api_key: str,
+    voice: str,
+) -> dict[str, list[rtc.AudioFrame]]:
+    """Lazy-init cache of pre-synth closing audio, keyed by status.
+
+    Stored on proc.userdata so all calls in this worker process share it.
+    Concurrent first-call attempts are serialized via an asyncio.Lock —
+    only one synthesis pass happens even if N calls land simultaneously.
+    """
+    cache_key = f"closing_audio::{voice}"
+    lock_key = "closing_audio_lock"
+
+    if cache_key in proc_userdata and proc_userdata[cache_key]:
+        return proc_userdata[cache_key]
+
+    if lock_key not in proc_userdata:
+        proc_userdata[lock_key] = asyncio.Lock()
+
+    async with proc_userdata[lock_key]:
+        # Re-check inside the lock — another coroutine may have built it.
+        if cache_key in proc_userdata and proc_userdata[cache_key]:
+            return proc_userdata[cache_key]
+
+        logger.info(
+            f"[CLOSING_SYNTH] pre-synthesizing {len(CLOSING_MESSAGES)} "
+            f"closing lines via xai.TTS (voice={voice})..."
+        )
+        t0 = time.monotonic()
+        tts = xai_plugin.TTS(voice=voice, api_key=api_key)
+        try:
+            results = await asyncio.gather(
+                *[_synthesize_to_frames(tts, text) for text in CLOSING_MESSAGES.values()],
+                return_exceptions=True,
+            )
+        finally:
+            try:
+                await tts.aclose()
+            except Exception:
+                pass
+
+        cache: dict[str, list[rtc.AudioFrame]] = {}
+        for status, result in zip(CLOSING_MESSAGES.keys(), results):
+            if isinstance(result, BaseException):
+                logger.error(
+                    f"[CLOSING_SYNTH] failed for status={status}: {result}; "
+                    "this status will fall back to model TTS at end-of-call"
+                )
+                continue
+            cache[status] = result
+
+        proc_userdata[cache_key] = cache
+        elapsed = (time.monotonic() - t0) * 1000.0
+        logger.info(
+            f"[CLOSING_SYNTH] cached {len(cache)}/{len(CLOSING_MESSAGES)} "
+            f"closing lines in {elapsed:.1f}ms"
+        )
+        return cache
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +541,7 @@ class VTAAgent(Agent):
         ctx: agents.JobContext | None = None,
         sip_identity: str = "",
         http: aiohttp.ClientSession | None = None,
+        closing_audio_cache: dict[str, list[rtc.AudioFrame]] | None = None,
     ):
         self._phone = phone
         self._customer_info = customer_info
@@ -447,6 +551,12 @@ class VTAAgent(Agent):
         self._sip_identity = sip_identity
         self._http = http  # shared aiohttp session from prewarm
         self._ending = False  # guards against double-trigger of the end-call sequence
+        # Pre-synth audio bytes per status, populated in entrypoint via
+        # get_or_build_closing_audio_cache. If a status is missing here at
+        # _end_call time, we fall back to the model's TTS via generate_reply.
+        self._closing_audio_cache: dict[str, list[rtc.AudioFrame]] = (
+            closing_audio_cache or {}
+        )
 
         full_name = customer_info.get("full_name", "the customer")
         company_name = customer_info.get("company_name", "our company")
@@ -583,29 +693,79 @@ class VTAAgent(Agent):
                 except Exception as e:
                     logger.warning(f"wait_for_playout (pre-closing) failed: {e}")
 
-            # Step 3 — speak the verbatim closing through the Realtime model.
-            # generate_reply with strict instructions; reasoning model follows
-            # verbatim. allow_interruptions=False on the SpeechHandle so the
-            # caller can't talk over their own closing.
+            # Step 3 — speak the verbatim closing.
+            #
+            # PRIMARY PATH: pre-synth audio bytes from xai.TTS, played via
+            # session.say(text=..., audio=<frames>). This bypasses the
+            # realtime model's audio generation entirely — the bytes are
+            # exactly what xai.TTS produced for the canonical closing text.
+            # Physically impossible for the model to paraphrase audio it
+            # didn't generate.
+            #
+            # We first session.interrupt() to cancel any in-flight model
+            # response (the realtime model often auto-emits a brief
+            # acknowledgment after a tool call — "Okay, thank you..." —
+            # which would otherwise stack on top of our closing audio).
+            #
+            # FALLBACK PATH: if pre-synth wasn't available (TTS error at
+            # boot, or first-call race), use generate_reply with strict
+            # verbatim instructions. Less rigid but still works ~95%+ with
+            # the reasoning model.
             spoke_ok = False
             speak_t0 = time.monotonic()
+            audio_frames = self._closing_audio_cache.get(status)
+
             try:
-                speech_handle = await session.generate_reply(
-                    instructions=(
-                        "Speak the closing line below EXACTLY as written, "
-                        "word-for-word, in a warm professional tone, then stop. "
-                        "Do not add, remove, summarize, paraphrase, or rephrase "
-                        "anything. Do not say goodbye after — this IS the goodbye.\n\n"
-                        f"CLOSING LINE:\n{closing}"
-                    ),
-                )
-                if speech_handle is not None and hasattr(speech_handle, "wait_for_playout"):
-                    await speech_handle.wait_for_playout()
-                spoke_ok = True
+                session.interrupt()
             except Exception as e:
-                logger.error(f"generate_reply closing failed ({status}): {e}")
+                logger.warning(f"session.interrupt before closing failed: {e}")
+
+            if audio_frames:
+                # Rigid path — play pre-synth audio bytes
+                try:
+                    speech_handle = session.say(
+                        text=closing,
+                        audio=_frames_to_async_iter(audio_frames),
+                        allow_interruptions=False,
+                    )
+                    if speech_handle is not None and hasattr(speech_handle, "wait_for_playout"):
+                        await speech_handle.wait_for_playout()
+                    spoke_ok = True
+                    logger.info(
+                        f"[END_CALL] closing played from PRE-SYNTH audio "
+                        f"({len(audio_frames)} frames, status={status})"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"session.say(pre-synth) failed ({status}): {e}; "
+                        "falling back to generate_reply"
+                    )
 
             if not spoke_ok:
+                # Fallback — ask the model to speak it
+                try:
+                    speech_handle = await session.generate_reply(
+                        instructions=(
+                            "Speak the closing line below EXACTLY as written, "
+                            "word-for-word, in a warm professional tone, then stop. "
+                            "Do not add, remove, summarize, paraphrase, or rephrase "
+                            "anything. Do not say goodbye after — this IS the goodbye.\n\n"
+                            f"CLOSING LINE:\n{closing}"
+                        ),
+                    )
+                    if speech_handle is not None and hasattr(speech_handle, "wait_for_playout"):
+                        await speech_handle.wait_for_playout()
+                    spoke_ok = True
+                    logger.info(
+                        f"[END_CALL] closing played from FALLBACK generate_reply "
+                        f"(status={status})"
+                    )
+                except Exception as e:
+                    logger.error(f"generate_reply closing fallback failed ({status}): {e}")
+
+            if not spoke_ok:
+                # Last resort — sleep so we don't drop SIP on top of any
+                # audio that did manage to flow.
                 try:
                     await asyncio.sleep(max(3.0, len(closing) / 14.0))
                 except Exception:
@@ -959,12 +1119,37 @@ async def entrypoint(ctx: agents.JobContext):
             logger.warning(f"No customer info found for phone {phone}")
         timeline.mark("customer info ready")
 
+        # Pre-synth all 7 closing lines via xai.TTS, cached on the worker
+        # process. First call pays the synth cost (~1-2s); subsequent calls
+        # in the same worker process get instant cache hits. The cache
+        # builder is concurrency-safe (asyncio.Lock inside) so simultaneous
+        # first-time calls won't all synthesize.
+        proc_userdata = getattr(getattr(ctx, "proc", None), "userdata", None)
+        if proc_userdata is None:
+            # Defensive: if ctx.proc.userdata isn't there for some reason,
+            # use a per-call dict so we still try synth (no cross-call cache).
+            proc_userdata = {}
+        try:
+            closing_audio_cache = await get_or_build_closing_audio_cache(
+                proc_userdata=proc_userdata,
+                api_key=xai_api_key,
+                voice=GROK_VOICE,
+            )
+        except Exception as e:
+            logger.error(
+                f"closing audio cache build failed; will fall back to "
+                f"generate_reply for closings: {e}"
+            )
+            closing_audio_cache = {}
+        timeline.mark(f"closing audio cache ready ({len(closing_audio_cache)}/{len(CLOSING_MESSAGES)})")
+
         vta_agent = VTAAgent(
             phone=phone,
             customer_info=customer_info,
             ctx=ctx,
             sip_identity=sip_identity,
             http=http_session,
+            closing_audio_cache=closing_audio_cache,
         )
         timeline.mark("agent constructed")
 
