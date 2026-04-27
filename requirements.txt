@@ -1,7 +1,6 @@
-livekit-agents[openai,silero,google]>=1.0
-livekit-plugins-openai>=1.0
-livekit-plugins-google>=1.0
-livekit-plugins-silero>=1.0
+livekit-agents[openai,xai]>=1.5
+livekit-plugins-xai>=1.5
+livekit-plugins-openai>=1.5
 livekit-api>=1.0
 python-dotenv>=1.0.0
 aiohttp>=3.9.0

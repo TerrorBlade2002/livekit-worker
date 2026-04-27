@@ -16,39 +16,56 @@ from livekit.agents import (
     AudioConfig,
     BackgroundAudioPlayer,
     BuiltinAudioClip,
+    JobProcess,
     RunContext,
     function_tool,
+    metrics,
 )
 from livekit.agents.voice import room_io
-from livekit.plugins import openai, silero
-from livekit.plugins.google.beta import GeminiTTS
+from livekit.plugins.xai import realtime as xai_realtime
 
 load_dotenv()
 
 logger = logging.getLogger("vta-agent")
 logger.setLevel(logging.INFO)
 
-RAILWAY_SERVER_URL = os.getenv("RAILWAY_SERVER_URL", "https://virtual-transfer-agent-production.up.railway.app")
+RAILWAY_SERVER_URL = os.getenv(
+    "RAILWAY_SERVER_URL", "https://virtual-transfer-agent-production.up.railway.app"
+)
 
-# Cascaded pipeline knobs (env-overridable so we don't have to redeploy to swap voice/model).
-# gpt-4o (not -mini) — gpt-4o-mini was unreliable about firing the terminal
-# log_verification tool against this long, branchy system prompt. gpt-4o follows
-# the Terminal Tool Rule consistently. Override via env if cost is critical.
-OPENAI_LLM_MODEL = os.getenv("OPENAI_LLM_MODEL", "gpt-4o")
-OPENAI_LLM_TEMPERATURE = float(os.getenv("OPENAI_LLM_TEMPERATURE", "0.7"))
-OPENAI_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "whisper-1")
-GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
-# Female, conversational, customer-service-friendly Gemini voice.
-# Other good picks: "Leda", "Kore", "Vindemiatrix", "Achird".
-GEMINI_VOICE = os.getenv("GEMINI_VOICE", "Aoede")
-# Gemini API key. Plugin defaults to reading GOOGLE_API_KEY, but our deploy
-# uses GEMINI_API_KEY — we read either and pass it explicitly to the plugin.
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+# ---------------------------------------------------------------------------
+# Grok Realtime config
+#
+# We use the xAI Realtime API end-to-end (single STT+LLM+TTS model) to
+# minimise per-turn latency. Underlying model is `grok-4-1-fast-non-reasoning`
+# (hardcoded by the xai plugin's RealtimeModel as of livekit-plugins-xai 1.5.x).
+# This is NOT a chain-of-thought model — if you need reasoning, switch to the
+# cascaded path (LLM.with_x_ai(model="grok-4-1-fast-reasoning")), which costs
+# ~300-600ms more TTFT per turn.
+# ---------------------------------------------------------------------------
+XAI_API_KEY = os.getenv("XAI_API_KEY") or os.getenv("GROK_API_KEY")
+# Grok voices: Ara (female, default), Eve (female), Leo (male), Rex (male), Sal (male).
+GROK_VOICE = os.getenv("GROK_VOICE", "Ara")
+
+# AgentSession latency knobs — see docstrings on AgentSession for full details.
+# aec_warmup_duration default is 3.0s, which delays the opening line by
+# the same amount. SIP calls don't need AEC (audio is unidirectional through
+# TCN's SIP gateway), so we set it to 0 to claw back ~3s on the first reply.
+AEC_WARMUP_DURATION = float(os.getenv("AEC_WARMUP_DURATION", "0"))
+# preemptive_generation lets the LLM start composing a reply BEFORE the
+# user's turn is fully ended — significant mid-call latency win.
+PREEMPTIVE_GENERATION = os.getenv("PREEMPTIVE_GENERATION", "true").lower() == "true"
+# Endpointing — how long to wait after user stops speaking before declaring
+# turn end. Lower = snappier but more false interruptions.
+MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.4"))
+MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "3.0"))
 
 CONFIG_DIR = Path(__file__).parent / "config"
 
-# Closing messages are controlled server-side (deterministic) so hangup is
-# reliable and in Emma's voice; the LLM MUST NOT speak its own goodbye.
+# Closing messages are deterministic so hangup is reliable and in Emma's
+# voice; the LLM MUST NOT speak its own goodbye. We pass them through
+# generate_reply with verbatim instructions because Realtime models speak
+# via their own internal TTS pipeline (no separate session.say-able TTS).
 CLOSING_MESSAGES = {
     "verified": (
         "Thank you. We're calling regarding a personal business matter of yours. "
@@ -78,6 +95,33 @@ CLOSING_MESSAGES = {
 }
 
 TCN_TRANSFER_STATUSES = {"verified", "customer_wants_human"}
+
+
+# ---------------------------------------------------------------------------
+# Observability — Timeline helper
+#
+# Every entrypoint creates a Timeline and marks the wall-clock delta at each
+# stage. Logs go out as `[TTFT:<room>] +<delta>ms (total=<total>ms) <stage>`
+# so you can grep Railway logs for `[TTFT:` and see exactly where time was
+# spent on the linkback path.
+# ---------------------------------------------------------------------------
+class Timeline:
+    """Wall-clock stage tracker for a single call's startup path."""
+
+    def __init__(self, label: str):
+        self.label = label or "?"
+        self.t0 = time.monotonic()
+        self.last = self.t0
+        logger.info(f"[TTFT:{self.label}] +    0.0ms (total=    0.0ms)  __start__")
+
+    def mark(self, name: str) -> None:
+        now = time.monotonic()
+        delta = (now - self.last) * 1000.0
+        total = (now - self.t0) * 1000.0
+        logger.info(
+            f"[TTFT:{self.label}] +{delta:7.1f}ms (total={total:7.1f}ms)  {name}"
+        )
+        self.last = now
 
 
 def load_prompt(filename: str) -> str:
@@ -188,26 +232,39 @@ def find_primary_standard_participant(
     return None
 
 
-async def fetch_customer_info(phone: str) -> dict:
-    """Call the Railway server's /retell-webhook to look up customer data."""
+async def fetch_customer_info(phone: str, http: aiohttp.ClientSession | None = None) -> dict:
+    """Call the Railway server's /retell-webhook to look up customer data.
+
+    Accepts an optional shared aiohttp session — saves ~50-100ms vs spinning
+    up a new ClientSession per call (TLS + connection setup).
+    """
     normalized = normalize_phone(phone)
     payload = {"call_inbound": {"from_number": f"+1{normalized}"}}
+    timeout = aiohttp.ClientTimeout(total=3)  # tightened from 5s — server is local-region, p99 well under 1s
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{RAILWAY_SERVER_URL}/retell-webhook",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=5),
+        if http is None:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{RAILWAY_SERVER_URL}/retell-webhook", json=payload, timeout=timeout
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"Webhook returned {resp.status} for {normalized}")
+                        return {}
+                    data = await resp.json()
+        else:
+            async with http.post(
+                f"{RAILWAY_SERVER_URL}/retell-webhook", json=payload, timeout=timeout
             ) as resp:
                 if resp.status != 200:
                     logger.warning(f"Webhook returned {resp.status} for {normalized}")
                     return {}
                 data = await resp.json()
-                logger.info(f"Customer info for {normalized}: {data}")
-                inbound = data.get("call_inbound") or {}
-                dynvars = inbound.get("dynamic_variables") or {}
-                meta = inbound.get("metadata") or {}
-                return {**dynvars, **meta}
+
+        logger.info(f"Customer info for {normalized}: {data}")
+        inbound = data.get("call_inbound") or {}
+        dynvars = inbound.get("dynamic_variables") or {}
+        meta = inbound.get("metadata") or {}
+        return {**dynvars, **meta}
     except Exception as e:
         logger.error(f"Error fetching customer info: {e}")
         return {}
@@ -218,6 +275,7 @@ async def notify_call_ended(
     call_id: str,
     duration_ms: int,
     disconnection_reason: str,
+    http: aiohttp.ClientSession | None = None,
 ) -> None:
     """Fire /retell-call-ended so the Railway server can enrich or backfill disposition data."""
     normalized = normalize_phone(phone)
@@ -230,19 +288,30 @@ async def notify_call_ended(
             "disconnection_reason": disconnection_reason,
         },
     }
+    timeout = aiohttp.ClientTimeout(total=3)
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{RAILWAY_SERVER_URL}/retell-call-ended",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=5),
+        if http is None:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{RAILWAY_SERVER_URL}/retell-call-ended", json=payload, timeout=timeout
+                ) as resp:
+                    logger.info(f"call_ended notify for {normalized}: HTTP {resp.status}")
+        else:
+            async with http.post(
+                f"{RAILWAY_SERVER_URL}/retell-call-ended", json=payload, timeout=timeout
             ) as resp:
                 logger.info(f"call_ended notify for {normalized}: HTTP {resp.status}")
     except Exception as e:
         logger.error(f"Error notifying call_ended: {e}")
 
 
-async def log_verification_to_server(phone: str, status: str, summary: str, full_name: str) -> dict:
+async def log_verification_to_server(
+    phone: str,
+    status: str,
+    summary: str,
+    full_name: str,
+    http: aiohttp.ClientSession | None = None,
+) -> dict:
     """Log verification result to Railway server, same contract as Retell's log_verification function."""
     normalized = normalize_phone(phone)
     payload = {
@@ -255,23 +324,35 @@ async def log_verification_to_server(phone: str, status: str, summary: str, full
             "from_number": f"+1{normalized}",
         },
     }
+    timeout = aiohttp.ClientTimeout(total=3)
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{RAILWAY_SERVER_URL}/log-verification",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=5),
+        if http is None:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{RAILWAY_SERVER_URL}/log-verification", json=payload, timeout=timeout
+                ) as resp:
+                    data = await resp.json()
+        else:
+            async with http.post(
+                f"{RAILWAY_SERVER_URL}/log-verification", json=payload, timeout=timeout
             ) as resp:
                 data = await resp.json()
-                logger.info(f"Log verification response for {normalized}: {data}")
-                return data
+
+        logger.info(f"Log verification response for {normalized}: {data}")
+        return data
     except Exception as e:
         logger.error(f"Error logging verification: {e}")
         return {"error": str(e)}
 
 
 class VTAAgent(Agent):
-    """Virtual Transfer Agent — Emma (LiveKit replacement for Retell's Emma)."""
+    """Virtual Transfer Agent — Emma (LiveKit replacement for Retell's Emma).
+
+    Now powered by xAI Grok Realtime — single end-to-end voice model, no
+    cascaded STT/LLM/TTS pipeline. This collapses per-turn latency to the
+    Realtime model's TTFT (typically 300-600ms) instead of
+    STT_latency + LLM_latency + TTS_first_chunk_latency (1-2s aggregate).
+    """
 
     def __init__(
         self,
@@ -279,6 +360,7 @@ class VTAAgent(Agent):
         customer_info: dict,
         ctx: agents.JobContext | None = None,
         sip_identity: str = "",
+        http: aiohttp.ClientSession | None = None,
     ):
         self._phone = phone
         self._customer_info = customer_info
@@ -286,6 +368,7 @@ class VTAAgent(Agent):
         self._call_end_notified = False
         self._ctx = ctx
         self._sip_identity = sip_identity
+        self._http = http  # shared aiohttp session from prewarm
         self._ending = False  # guards against double-trigger of the end-call sequence
 
         full_name = customer_info.get("full_name", "the customer")
@@ -314,8 +397,6 @@ class VTAAgent(Agent):
         moment the job starts. We also try `room_io.linked_participant` as a
         fast path for the "this is definitely the SIP leg" case.
         """
-        # Fast path: room_io.linked_participant is set when set_participant()
-        # was called or auto-detected — and if it's a SIP kind, that IS our leg.
         room_io_obj = getattr(session, "room_io", None)
         linked_participant = getattr(room_io_obj, "linked_participant", None)
         if (
@@ -324,7 +405,6 @@ class VTAAgent(Agent):
         ):
             self._sip_identity = linked_participant.identity or self._sip_identity
 
-        # Fallback: scan the room. Try ctx.room first (stable), then room_io.room.
         room: rtc.Room | None = None
         if self._ctx is not None:
             room = getattr(self._ctx, "room", None)
@@ -347,25 +427,10 @@ class VTAAgent(Agent):
     #     this room is the LiveKit-side endpoint of leg B)
     #   - LiveKit room: { SIP participant, vta-emma agent }
     #
-    # We follow LiveKit's canonical end-call pattern (telephony docs):
-    # do EVERYTHING inline-awaited inside the tool body. This guarantees
-    # the LLM cannot generate a stray follow-up reply before the SIP leg
-    # is gone, and that the BYE reaches TCN cleanly so the broadcast
-    # template fires Action OK and advances:
-    #   Linkback (Action OK) -> Data Dip -> Set Value -> Hunt Group.
-    #
-    # Specifically NOT used here:
-    #   - asyncio.create_task(...) for the end-call sequence — the prior
-    #     fire-and-forget pattern raced with the LLM's auto-generated
-    #     follow-up reply, often resulting in either a half-spoken closing
-    #     or a missed BYE that TCN treated as Action Error.
-    #   - session.interrupt() — wrong tool for the job in cascaded mode;
-    #     it cancels the speech queue but doesn't prevent the LLM from
-    #     enqueueing fresh audio after the tool returns.
-    #   - delete_room — produces disconnect_reason=ROOM_DELETED on the BYE
-    #     which some TCN templates treat as abnormal. We use
-    #     RemoveParticipant on SIP only (PARTICIPANT_REMOVED) so TCN sees
-    #     a clean leg-B teardown and fires Action OK.
+    # With Realtime models, we use generate_reply(instructions=...) for the
+    # closing because session.say bypasses the model's own TTS in some
+    # configurations. generate_reply with verbatim instructions makes the
+    # Realtime model speak the exact closing through its own audio pipeline.
     # ------------------------------------------------------------------
     @function_tool()
     async def log_verification(
@@ -391,36 +456,27 @@ class VTAAgent(Agent):
         """
         # Outermost shield: this tool MUST NOT raise. If it raises, the LLM
         # gets an error response and starts ad-libbing ("An internal error
-        # has occurred"), which (a) isn't deterministic and (b) doesn't end
-        # the call. Every code path below is wrapped, and we always return
-        # None, even on catastrophic failure.
+        # has occurred"), which doesn't end the call. Every code path below
+        # is wrapped, and we always return None.
         try:
+            tool_t0 = time.monotonic()
             logger.info(
                 f"log_verification called: phone={self._phone} status={status} "
                 f"summary={summary!r}"
             )
 
-            # Idempotency — if the LLM somehow calls this twice, no-op the second.
             if self._ending:
                 logger.warning("log_verification called twice — second call ignored")
                 return None
             self._ending = True
             self._full_name = full_name or self._full_name
 
-            # Disable interruptions for the rest of this tool call. Per LiveKit
-            # docs, this is required for any tool that takes non-rollbackable
-            # external actions (we're about to log + speak + hang up SIP).
             try:
                 context.disallow_interruptions()
             except Exception as e:
                 logger.warning(f"disallow_interruptions failed (continuing): {e}")
 
             session: AgentSession = context.session
-            # IMPORTANT: AgentSession does NOT expose `.room` in livekit-agents
-            # 1.x. The room lives on the JobContext (self._ctx.room) and on
-            # session.room_io.room. We use ctx.room as the primary source
-            # because it's stable from job start. Anything that goes wrong
-            # here we degrade gracefully — never raise.
             room: rtc.Room | None = None
             if self._ctx is not None:
                 room = getattr(self._ctx, "room", None)
@@ -431,48 +487,49 @@ class VTAAgent(Agent):
             closing = CLOSING_MESSAGES.get(status, CLOSING_MESSAGES["other"])
 
             # Step 1 — log to the Railway server (Retell-compatible contract).
-            # Best-effort: failure here doesn't block hangup; the server-side
-            # pruner reconciles via /retell-call-ended below.
             try:
-                await log_verification_to_server(self._phone, status, summary, full_name)
+                await log_verification_to_server(self._phone, status, summary, full_name, http=self._http)
             except Exception as e:
                 logger.error(f"log_verification_to_server failed; continuing: {e}")
+            logger.info(f"[END_CALL_TIMING] log_to_server +{(time.monotonic()-tool_t0)*1000:.1f}ms")
 
-            # Step 2 — drain any speech that's already in flight (e.g. the LLM
-            # was mid-sentence when it decided to call this tool). Per docs:
-            # "Use ctx.wait_for_playout() to wait for any pre-tool speech to finish."
+            # Step 2 — drain any speech already in flight.
             try:
                 await context.wait_for_playout()
             except Exception as e:
                 logger.warning(f"wait_for_playout (pre-closing) failed: {e}")
 
-            # Step 3 — speak the deterministic closing INLINE and wait for it
-            # to fully play out. allow_interruptions=False so caller speech
-            # (or anything else) can't truncate it.
-            #
-            # CRITICAL API DETAIL: session.say() is NOT a coroutine — it
-            # returns SpeechHandle directly. Do NOT `await session.say(...)`;
-            # that would await SpeechHandle.__await__ (which yields the
-            # internal future result, NOT the handle), and the variable
-            # would no longer be the SpeechHandle. Get the handle first,
-            # then await wait_for_playout() on it.
+            # Step 3 — speak the verbatim closing through the Realtime model.
+            # We use generate_reply with strict verbatim instructions because
+            # Realtime models route ALL audio output through their internal
+            # pipeline; session.say with no separate TTS configured falls
+            # back to the realtime model anyway.
             spoke_ok = False
+            speak_t0 = time.monotonic()
             try:
-                speech_handle = session.say(closing, allow_interruptions=False)
-                await speech_handle.wait_for_playout()
+                speech_handle = await session.generate_reply(
+                    instructions=(
+                        "Speak the following text VERBATIM, exactly word-for-word. "
+                        "Do NOT add, remove, summarize, paraphrase, or change anything. "
+                        "Speak in a warm, polite tone, then stop:\n\n"
+                        f'"{closing}"'
+                    ),
+                )
+                if speech_handle is not None and hasattr(speech_handle, "wait_for_playout"):
+                    await speech_handle.wait_for_playout()
                 spoke_ok = True
             except Exception as e:
-                logger.error(f"session.say closing failed ({status}): {e}")
+                logger.error(f"generate_reply closing failed ({status}): {e}")
 
             if not spoke_ok:
-                # Fallback timing estimate (~14 chars/sec TTS rate) so the
-                # SIP leg isn't dropped on top of any in-flight audio.
+                # Fallback timing estimate (~14 chars/sec TTS rate).
                 try:
                     await asyncio.sleep(max(3.0, len(closing) / 14.0))
                 except Exception:
                     pass
+            logger.info(f"[END_CALL_TIMING] closing_spoken +{(time.monotonic()-speak_t0)*1000:.1f}ms")
 
-            # Step 4 — notify the Railway server the call ended (Retell-compatible).
+            # Step 4 — notify the Railway server the call ended.
             if not self._call_end_notified:
                 duration_ms = max(0, int((time.monotonic() - self._call_started_at) * 1000))
                 try:
@@ -481,6 +538,7 @@ class VTAAgent(Agent):
                         call_id=room_name,
                         duration_ms=duration_ms,
                         disconnection_reason=f"agent_end_call:{status}",
+                        http=self._http,
                     )
                 except Exception as e:
                     logger.error(f"notify_call_ended failed ({status}): {e}")
@@ -494,11 +552,6 @@ class VTAAgent(Agent):
                 logger.error(f"[END_CALL] _resolve_sip_identity failed: {e}")
 
             # Step 6 — surgical hangup: remove ONLY the SIP participant.
-            # This sends a clean BYE on leg B back to TCN with
-            # disconnect_reason=PARTICIPANT_REMOVED. TCN's broadcast template
-            # treats this as Action OK and advances:
-            #   Linkback -> Data Dip (/verification-status) -> Set Value -> Hunt Group
-            # Leg A (TCN <-> Customer) is untouched.
             removed_ok = False
             if self._ctx is not None and room_name and sip_identity:
                 try:
@@ -513,6 +566,7 @@ class VTAAgent(Agent):
                         f"[END_CALL] status={status} phone={self._phone} "
                         f"room={room_name} sip_identity={sip_identity} "
                         f"tcn_http={tcn_http_code_for_status(status)} "
+                        f"total={(time.monotonic()-tool_t0)*1000:.1f}ms "
                         f"— SIP participant removed, BYE en route to TCN"
                     )
                 except Exception as e:
@@ -522,8 +576,6 @@ class VTAAgent(Agent):
                     )
 
             # Step 7 — fallback if we couldn't identify/remove the SIP participant.
-            # delete_room is a heavier hammer (BYE with disconnect_reason=ROOM_DELETED)
-            # but at least guarantees the call ends rather than leaving a stuck leg.
             if not removed_ok:
                 logger.warning(
                     f"[END_CALL] no SIP identity to remove "
@@ -537,23 +589,15 @@ class VTAAgent(Agent):
                         logger.info(f"[END_CALL] delete_room fallback fired for room={room_name}")
                     except Exception as e:
                         logger.error(f"[END_CALL] delete_room fallback failed: {e}")
-                        # Last resort — disconnect ourselves so the worker job doesn't hang.
                         if room is not None:
                             try:
                                 await room.disconnect()
                             except Exception as e2:
                                 logger.error(f"[END_CALL] room.disconnect last-resort failed: {e2}")
 
-            # Return None so the LLM has no string to chew on. The SIP leg is
-            # already gone by this point, so any follow-up the LLM tries to emit
-            # has no audience.
             return None
 
         except Exception as fatal:
-            # Last-ditch shield. If anything in the tool body raised
-            # unexpectedly, we still try to drop the SIP leg so the call
-            # doesn't hang, and we swallow the error so the LLM doesn't
-            # apologize about an "internal error" in the customer's ear.
             logger.exception(f"[END_CALL] FATAL in log_verification: {fatal}")
             try:
                 if self._ctx is not None:
@@ -574,198 +618,281 @@ class VTAAgent(Agent):
             return None
 
 
+# ---------------------------------------------------------------------------
+# prewarm — runs ONCE per worker process at startup, before any jobs land.
+#
+# Use this to load anything heavy that would otherwise add latency to the
+# first call. We share an aiohttp.ClientSession so per-call HTTPS handshakes
+# to Railway aren't re-established cold.
+# ---------------------------------------------------------------------------
+def prewarm(proc: JobProcess) -> None:
+    """Pre-load expensive, reusable resources before the first job arrives."""
+    t0 = time.monotonic()
+    # Persistent HTTP session — TLS handshake is one-time-paid, connections are pooled.
+    # The actual session is created lazily in entrypoint because aiohttp insists
+    # the session live in an asyncio loop (and prewarm runs synchronously).
+    proc.userdata["http_session"] = None
+    # Pre-resolve XAI / Railway DNS by doing a tiny TCP probe? Not necessary —
+    # connections are pooled inside the loop in any case.
+    elapsed = (time.monotonic() - t0) * 1000.0
+    logger.info(f"[PREWARM] worker process initialized in {elapsed:.1f}ms")
+
+
 async def entrypoint(ctx: agents.JobContext):
-    """Main entrypoint — dispatched for each inbound SIP call from TCN."""
-    logger.info(f"Agent entrypoint called. Room: {ctx.room.name}")
+    """Main entrypoint — dispatched for each inbound SIP call from TCN.
 
-    await ctx.connect()
+    Latency budget on this path (target):
+      0-50ms    entrypoint called (job dispatched)
+      50-150ms  ctx.connect (room WS handshake)
+      150-300ms SIP participant present (TCN INVITE → LiveKit SIP gateway)
+      300-400ms customer info fetched (parallel with model setup)
+      400-500ms session.start done
+      500-1500ms first audio frame from Grok Realtime (TTFT)
 
-    phone = ""
-    sip_identity = ""
-    linked_identity = ""
-    customer_info = {}
+    Anything that creeps in beyond that shows up in the [TTFT:...] log lines.
+    """
+    timeline = Timeline(ctx.room.name or "unknown")
 
-    logger.info("Waiting for SIP participant...")
+    if XAI_API_KEY is None:
+        logger.error("XAI_API_KEY (or GROK_API_KEY) is not set — agent cannot start")
+        return
 
-    def refresh_sip_context() -> None:
-        nonlocal phone, sip_identity, linked_identity
-        sip_participant = find_primary_sip_participant(ctx.room, preferred_identity=sip_identity)
-        if sip_participant is not None:
-            sip_identity = sip_participant.identity or sip_identity
-            linked_identity = sip_identity or linked_identity
-            extracted_phone = extract_phone_from_participant(sip_participant)
-            if extracted_phone:
-                phone = extracted_phone
+    # Shared HTTP session — saves TLS+connection-setup on every Railway call (~50-150ms).
+    http_session = aiohttp.ClientSession()
+    timeline.mark("http session up")
 
-            logger.info(
-                "Primary SIP participant: identity=%s callStatus=%s phone=%s metadata=%s",
-                sip_participant.identity,
-                (sip_participant.attributes or {}).get("sip.callStatus", ""),
-                phone,
-                sip_participant.metadata,
+    try:
+        await ctx.connect()
+        timeline.mark("ctx.connect done")
+
+        phone = ""
+        sip_identity = ""
+        linked_identity = ""
+
+        def refresh_sip_context() -> None:
+            nonlocal phone, sip_identity, linked_identity
+            sip_participant = find_primary_sip_participant(ctx.room, preferred_identity=sip_identity)
+            if sip_participant is not None:
+                sip_identity = sip_participant.identity or sip_identity
+                linked_identity = sip_identity or linked_identity
+                extracted_phone = extract_phone_from_participant(sip_participant)
+                if extracted_phone:
+                    phone = extracted_phone
+                logger.info(
+                    "Primary SIP participant: identity=%s callStatus=%s phone=%s",
+                    sip_participant.identity,
+                    (sip_participant.attributes or {}).get("sip.callStatus", ""),
+                    phone,
+                )
+                return
+
+            standard_participant = find_primary_standard_participant(
+                ctx.room, preferred_identity=linked_identity,
             )
-            return
+            if standard_participant is not None:
+                linked_identity = standard_participant.identity or linked_identity
+                logger.info(
+                    "Primary standard participant for console/dev: identity=%s",
+                    standard_participant.identity,
+                )
 
-        standard_participant = find_primary_standard_participant(
-            ctx.room,
-            preferred_identity=linked_identity,
+        refresh_sip_context()
+
+        if not phone and not linked_identity:
+            participant_connected = asyncio.Event()
+
+            @ctx.room.on("participant_connected")
+            def on_participant_connected(participant: rtc.RemoteParticipant):
+                refresh_sip_context()
+                if phone or linked_identity:
+                    participant_connected.set()
+
+            try:
+                # Tightened from 30s to 10s — TCN INVITE → LiveKit SIP participant
+                # is sub-second in normal operation. 10s is generous for retries.
+                await asyncio.wait_for(participant_connected.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("No SIP participant joined within 10s. Using room metadata.")
+
+        timeline.mark("SIP participant resolved")
+
+        if not phone and ctx.job.metadata:
+            try:
+                meta = json.loads(ctx.job.metadata)
+                phone = normalize_phone(meta.get("phone", "") or meta.get("caller_id", ""))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        if not phone:
+            room_match = re.search(r"(\d{10,})", ctx.room.name)
+            if room_match:
+                phone = normalize_phone(room_match.group(1))
+
+        logger.info(f"Caller phone: {phone}")
+
+        # PARALLELISM WIN: kick off customer info fetch while we're building
+        # the model and agent. Both finish in ~50-200ms; doing them sequentially
+        # added 200-400ms to TTFT.
+        if phone:
+            customer_info_task = asyncio.create_task(fetch_customer_info(phone, http=http_session))
+        else:
+            customer_info_task = None
+        timeline.mark("customer info fetch fired (async)")
+
+        # Build Grok Realtime model. Constructor is cheap — actual WS connection
+        # to wss://api.x.ai/v1/realtime opens during session.start.
+        rt_model = xai_realtime.RealtimeModel(
+            voice=GROK_VOICE,
+            api_key=XAI_API_KEY,
         )
-        if standard_participant is not None:
-            linked_identity = standard_participant.identity or linked_identity
-            logger.info(
-                "Primary standard participant for console/dev: identity=%s metadata=%s",
-                standard_participant.identity,
-                standard_participant.metadata,
-            )
+        timeline.mark("realtime model constructed")
 
-    refresh_sip_context()
+        # Await customer info now (will be ready by this point in most cases).
+        if customer_info_task is not None:
+            try:
+                customer_info = await customer_info_task
+            except Exception as e:
+                logger.error(f"customer info fetch failed: {e}")
+                customer_info = {}
+        else:
+            customer_info = {}
 
-    if not phone and not linked_identity:
-        participant_connected = asyncio.Event()
+        if not customer_info.get("full_name"):
+            customer_info["full_name"] = "the customer"
+            logger.warning(f"No customer info found for phone {phone}")
+        timeline.mark("customer info ready")
 
-        @ctx.room.on("participant_connected")
-        def on_participant_connected(participant: rtc.RemoteParticipant):
-            refresh_sip_context()
-            if phone or linked_identity:
-                participant_connected.set()
+        vta_agent = VTAAgent(
+            phone=phone,
+            customer_info=customer_info,
+            ctx=ctx,
+            sip_identity=sip_identity,
+            http=http_session,
+        )
+        timeline.mark("agent constructed")
 
-        try:
-            await asyncio.wait_for(participant_connected.wait(), timeout=30.0)
-        except asyncio.TimeoutError:
-            logger.warning("No SIP participant joined within 30s. Using room metadata.")
+        # Build the AgentSession with Realtime LLM and explicit latency knobs.
+        session = AgentSession(
+            llm=rt_model,
+            # AEC warmup default is 3.0s — for SIP audio (unidirectional via
+            # gateway) AEC isn't needed, so we set this to 0 to claw back ~3s
+            # off the opening line TTFT.
+            aec_warmup_duration=AEC_WARMUP_DURATION,
+            # Start composing replies before the user fully finishes (mid-call
+            # latency win — typically 200-500ms saved per turn).
+            preemptive_generation=PREEMPTIVE_GENERATION,
+            min_endpointing_delay=MIN_ENDPOINTING_DELAY,
+            max_endpointing_delay=MAX_ENDPOINTING_DELAY,
+        )
 
-    if not phone and ctx.job.metadata:
-        try:
-            meta = json.loads(ctx.job.metadata)
-            phone = normalize_phone(meta.get("phone", "") or meta.get("caller_id", ""))
-        except (json.JSONDecodeError, TypeError):
-            pass
+        # Observability: log per-turn latency from the model itself.
+        # RealtimeModelMetrics has `ttft` (seconds) — that's the model's own
+        # time-to-first-token, distinct from our wall-clock end-to-end TTFT.
+        @session.on("metrics_collected")
+        def on_metrics(ev) -> None:
+            try:
+                m = ev.metrics
+                label = type(m).__name__
+                ttft = getattr(m, "ttft", None)
+                duration = getattr(m, "duration", None)
+                request_id = getattr(m, "request_id", "") or ""
+                parts = [f"[METRICS:{label}]"]
+                if ttft is not None and ttft >= 0:
+                    parts.append(f"ttft={ttft*1000:.1f}ms")
+                if duration is not None and duration >= 0:
+                    parts.append(f"duration={duration*1000:.1f}ms")
+                if request_id:
+                    parts.append(f"req={request_id}")
+                logger.info(" ".join(parts))
+            except Exception as e:
+                logger.warning(f"metrics handler failed: {e}")
 
-    if not phone:
-        room_match = re.search(r"(\d{10,})", ctx.room.name)
-        if room_match:
-            phone = normalize_phone(room_match.group(1))
-
-    logger.info(f"Caller phone: {phone}")
-
-    if phone:
-        customer_info = await fetch_customer_info(phone)
-
-    if not customer_info.get("full_name"):
-        customer_info["full_name"] = "the customer"
-        logger.warning(f"No customer info found for phone {phone}")
-
-    vta_agent = VTAAgent(
-        phone=phone,
-        customer_info=customer_info,
-        ctx=ctx,
-        sip_identity=sip_identity,
-    )
-
-    # Cascaded STT -> LLM -> TTS pipeline.
-    #
-    # Why cascaded (vs the previous Realtime model):
-    #   - Verbatim closings: TTS faithfully speaks the exact CLOSING_MESSAGES
-    #     text. Realtime models paraphrase even when instructed not to.
-    #   - Cheaper per minute (Whisper + 4o-mini + Gemini Flash TTS).
-    #   - Easy to swap any leg independently via env vars.
-    #
-    # STT: OpenAI Whisper, English-pinned (avoid silent failures from foreign
-    #      transcripts upstream of the LLM).
-    # LLM: OpenAI gpt-4o by default — gpt-4o-mini was unreliable about calling
-    #      the terminal log_verification tool against this long system prompt.
-    #      Override via OPENAI_LLM_MODEL if cost is critical.
-    # TTS: Google Gemini 2.5 Flash Preview TTS. The plugin's default
-    #      `instructions` ("Say the text with a proper tone, don't omit or
-    #      add any words") is exactly the verbatim guarantee we want for
-    #      compliance-sensitive closings.
-    # VAD: Silero (required for cascaded pipelines — drives turn detection).
-    session = AgentSession(
-        stt=openai.STT(
-            model=OPENAI_STT_MODEL,
-            language="en",
-            prompt="English only. Transcribe non-English words phonetically in English characters.",
-        ),
-        llm=openai.LLM(
-            model=OPENAI_LLM_MODEL,
-            temperature=OPENAI_LLM_TEMPERATURE,
-        ),
-        tts=GeminiTTS(
-            model=GEMINI_TTS_MODEL,
-            voice_name=GEMINI_VOICE,
-            api_key=GEMINI_API_KEY,
-        ),
-        vad=silero.VAD.load(),
-    )
-
-    room_options = room_io.RoomOptions(
-        participant_kinds=[
-            rtc.ParticipantKind.PARTICIPANT_KIND_SIP,
-            rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD,
-        ],
-        delete_room_on_close=False,
-    )
-    if linked_identity:
         room_options = room_io.RoomOptions(
             participant_kinds=[
                 rtc.ParticipantKind.PARTICIPANT_KIND_SIP,
                 rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD,
             ],
-            participant_identity=linked_identity,
             delete_room_on_close=False,
         )
+        if linked_identity:
+            room_options = room_io.RoomOptions(
+                participant_kinds=[
+                    rtc.ParticipantKind.PARTICIPANT_KIND_SIP,
+                    rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD,
+                ],
+                participant_identity=linked_identity,
+                delete_room_on_close=False,
+            )
 
-    await session.start(room=ctx.room, agent=vta_agent, room_options=room_options)
+        await session.start(room=ctx.room, agent=vta_agent, room_options=room_options)
+        timeline.mark("session.start done (Grok WS connected)")
 
-    linked_participant = getattr(getattr(session, "room_io", None), "linked_participant", None)
-    if linked_participant is not None and linked_participant.identity:
-        linked_identity = linked_participant.identity
-        if linked_participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
-            vta_agent._sip_identity = linked_participant.identity
-        if not phone:
-            phone = extract_phone_from_participant(linked_participant)
-            vta_agent._phone = phone
+        linked_participant = getattr(getattr(session, "room_io", None), "linked_participant", None)
+        if linked_participant is not None and linked_participant.identity:
+            linked_identity = linked_participant.identity
+            if linked_participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+                vta_agent._sip_identity = linked_participant.identity
+            if not phone:
+                phone = extract_phone_from_participant(linked_participant)
+                vta_agent._phone = phone
 
-    # Ambient call-center background audio — published on a separate outbound
-    # track, never mixed into the Realtime TTS stream or fed back into STT.
-    # Wrapped in try/except so a BackgroundAudioPlayer failure can never abort
-    # the call — Emma will still speak, just without ambience.
-    background_audio = None
-    try:
-        background_audio = BackgroundAudioPlayer(
-            ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=0.35),
-            thinking_sound=[
-                AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING, volume=0.4, probability=0.7),
-                AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING2, volume=0.4, probability=0.3),
-            ],
-        )
-        await background_audio.start(room=ctx.room, agent_session=session)
-        logger.info("BackgroundAudioPlayer started (OFFICE_AMBIENCE)")
-    except Exception as e:
-        logger.error(f"BackgroundAudioPlayer failed to start (call continues without it): {e}")
+        # Background ambience — wrapped so a player failure never aborts the call.
         background_audio = None
+        try:
+            background_audio = BackgroundAudioPlayer(
+                ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=0.35),
+                # No thinking_sound for Realtime — TTFT is sub-second so the
+                # keyboard typing sound would clash with the model's own response.
+            )
+            await background_audio.start(room=ctx.room, agent_session=session)
+            logger.info("BackgroundAudioPlayer started (OFFICE_AMBIENCE)")
+        except Exception as e:
+            logger.error(f"BackgroundAudioPlayer failed to start (call continues without it): {e}")
+            background_audio = None
+        timeline.mark("background audio started")
 
-    async def _cleanup_background_audio():
-        if background_audio is not None:
+        async def _cleanup():
+            if background_audio is not None:
+                try:
+                    await background_audio.aclose()
+                except Exception as e:
+                    logger.error(f"Error closing background audio: {e}")
             try:
-                await background_audio.aclose()
+                await http_session.close()
             except Exception as e:
-                logger.error(f"Error closing background audio: {e}")
+                logger.error(f"Error closing http session: {e}")
 
-    ctx.add_shutdown_callback(_cleanup_background_audio)
+        ctx.add_shutdown_callback(_cleanup)
 
-    full_name = customer_info.get("full_name", "the customer")
-    await session.generate_reply(
-        instructions=load_prompt("opening_line.md").format(full_name=full_name)
-    )
+        # Trigger the opening line. With Realtime, this is a generate_reply
+        # with the verbatim opening as the instruction.
+        full_name = customer_info.get("full_name", "the customer")
+        opening = load_prompt("opening_line.md").format(full_name=full_name)
+        await session.generate_reply(
+            instructions=(
+                "Speak the following greeting VERBATIM, exactly word-for-word, "
+                "in a warm, polite tone, then stop and wait for the caller's reply:\n\n"
+                f'"{opening}"'
+            ),
+        )
+        timeline.mark("opening reply queued")
 
-    logger.info(f"VTA agent started for {phone} ({full_name})")
+        logger.info(f"VTA agent started for {phone} ({full_name}) using Grok Realtime ({GROK_VOICE})")
+
+    except Exception:
+        # Make sure http session is closed on early failure.
+        try:
+            await http_session.close()
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == "__main__":
     agents.cli.run_app(
         agents.WorkerOptions(
             entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
             agent_name="vta-emma",
         )
     )
