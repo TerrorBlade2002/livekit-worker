@@ -23,6 +23,7 @@ from livekit.agents import (
 )
 from livekit.agents.voice import room_io
 from livekit.plugins import openai as openai_plugin
+from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
 
 # ---------------------------------------------------------------------------
 # .env loading — robust against arbitrary cwd
@@ -918,6 +919,13 @@ async def entrypoint(ctx: agents.JobContext):
         # plugin's wrapper, because the wrapper hardcodes the older
         # non-reasoning model. The protocol is OpenAI-Realtime-spec-compatible
         # so this just works pointed at the xAI base URL.
+        #
+        # CRITICAL: explicit turn_detection=ServerVad(...) is required.
+        # The OpenAI Realtime client now defaults to "semantic_vad" (a newer
+        # OpenAI-only feature) — but xAI's Realtime endpoint only supports
+        # "server_vad" and rejects the connection with
+        # "Invalid event received ... 'semantic_vad'" otherwise. These
+        # parameters mirror what livekit-plugins-xai uses internally.
         rt_model = openai_plugin.realtime.RealtimeModel(
             base_url=GROK_REALTIME_BASE_URL,
             model=GROK_REALTIME_MODEL,
@@ -925,6 +933,14 @@ async def entrypoint(ctx: agents.JobContext):
             voice=GROK_VOICE,
             temperature=GROK_TEMPERATURE,
             modalities=["audio"],
+            turn_detection=ServerVad(
+                type="server_vad",
+                threshold=0.5,
+                prefix_padding_ms=300,
+                silence_duration_ms=200,
+                create_response=True,
+                interrupt_response=True,
+            ),
         )
         timeline.mark("realtime model constructed")
 
