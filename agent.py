@@ -561,29 +561,27 @@ class VTAAgent(Agent):
     # LLM-driven end-call: log_verification tool
     #
     # Auto-discovered by the Agent framework via @function_tool() decorator.
-    # Generates a FunctionTool with Pydantic schema (strict mode) which
-    # the xAI Realtime model handles correctly — calling the tool in the
-    # SAME response turn as the closing speech.
-    #
     # The LLM has ALREADY spoken the closing line before calling this tool
-    # (per the prompt's CLOSING PROTOCOL). This tool just logs the
-    # disposition and tears down the SIP leg.
+    # (per the prompt's CLOSING PROTOCOL). This tool logs the disposition,
+    # waits for the closing audio to drain, then tears down the SIP leg.
     #
-    # RACE-CONDITION FIX (ref: Riley agent pattern):
-    #   The closing-line audio and this tool call are part of the SAME
-    #   Realtime response (same speech_handle). Audio is still streaming
-    #   to the customer when the tool fires. If we remove the SIP
-    #   participant inline, the audio gets cut off mid-sentence.
+    # The tool blocks until the SIP participant is removed. By the time it
+    # returns, the leg is gone — so any follow-up turn the model tries to
+    # generate after receiving the (empty) tool result has nowhere to go.
+    # That's what prevents the "agent says 'thank you, I'll update' a
+    # second time and then waits forever" failure mode: we don't hand
+    # control back to the model until the call is already ended.
     #
-    #   Solution — three-phase lifecycle:
-    #     Phase 1: Arm speech_handle.add_done_callback FIRST (before any
-    #              I/O) so the call WILL end even if the HTTP POST hangs.
-    #     Phase 2: Log disposition to Railway INLINE (data must never be
-    #              lost). Signal _logging_complete when done.
-    #     Phase 3: (in callback) Wait for _logging_complete, THEN remove
-    #              SIP participant, THEN shut down the job context.
-    #
-    #   Safety net: 10s timeout fires teardown if the callback never does.
+    # Phases (sequential, bounded):
+    #   1. Mark _ending, disallow user interruptions.
+    #   2. Run HTTP logging AND wait-for-closing-playout in parallel,
+    #      capped at 15s overall. ctx.wait_for_playout() blocks only on
+    #      the prior spoken response (the closing line) — it does NOT
+    #      wait for this tool to finish, so there's no circular wait.
+    #   3. 300ms buffer so the last audio frames flush to the SIP encoder
+    #      before we send BYE (avoids the "cut off mid-syllable" race).
+    #   4. _teardown(skip_logging=True) — remove the SIP participant.
+    #   5. ctx.shutdown() — clean worker exit.
     # ------------------------------------------------------------------
     @function_tool(
         description=(
@@ -634,7 +632,7 @@ class VTAAgent(Agent):
         self._ending = True
         self._full_name = full_name or self._full_name
 
-        # Prevent user speech from interrupting the teardown sequence
+        # Prevent user speech from interrupting the teardown sequence.
         try:
             ctx.disallow_interruptions()
         except Exception as e:
@@ -647,137 +645,97 @@ class VTAAgent(Agent):
 
         session = ctx.session
 
-        # Coordination event: _finish() waits on this before touching the
-        # SIP leg, so the http_session is never closed out from under an
-        # in-flight POST.
-        _logging_complete = asyncio.Event()
-        _teardown_done = False
-
-        async def _finish() -> None:
-            """SIP teardown + job shutdown — runs exactly once.
-
-            Called from either the speech_handle callback (normal path) or
-            the safety timeout (fallback). Guarded by _teardown_done flag.
-            """
-            nonlocal _teardown_done
-            if _teardown_done:
-                return
-            _teardown_done = True
-
-            # Wait for the inline HTTP logging to complete before we touch
-            # the session/room — ctx.shutdown() would close the http_session.
-            try:
-                await asyncio.wait_for(_logging_complete.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "[END_CALL] logging didn't complete in 5s; "
-                    "proceeding with SIP teardown anyway"
-                )
-
-            logger.info(
-                "[END_CALL] executing deferred SIP teardown "
-                "(closing audio has finished playing)"
-            )
-
-            # SIP removal — sends clean BYE to TCN
-            try:
-                await self._teardown(
-                    status, summary, session=session, trigger="tool",
-                    skip_logging=True,  # already logged inline
-                )
-            except Exception as e:
-                logger.error(f"[END_CALL] deferred SIP teardown failed: {e}")
-
-            # Clean shutdown so the worker doesn't idle until job timeout.
-            # Triggers entrypoint's _cleanup callback (cancels watchdogs,
-            # closes http_session, stops background audio).
-            if self._ctx is not None:
-                try:
-                    self._ctx.shutdown(reason=f"agent_end_call:{status}")
-                except Exception as e:
-                    logger.warning(f"[END_CALL] ctx.shutdown failed: {e}")
-
-        # ---- PHASE 1: Arm shutdown callbacks BEFORE the HTTP POST ----
-        # Even if the POST hangs for its full 3s timeout, the call will
-        # still end as soon as the closing audio finishes playing.
-        callback_armed = False
-        try:
-            def _on_speech_done(_) -> None:
-                asyncio.ensure_future(_finish())
-
-            ctx.speech_handle.add_done_callback(_on_speech_done)
-            callback_armed = True
-            logger.info(
-                "[END_CALL] SIP teardown deferred — armed on speech_handle.done "
-                "(customer will hear full closing line before BYE)"
-            )
-        except Exception as e:
-            logger.warning(
-                f"[END_CALL] speech_handle.add_done_callback unavailable ({e}); "
-                "will fall back to inline teardown after logging"
-            )
-
-        # Safety timeout — if the speech_handle callback never fires (e.g.
-        # Realtime WS disconnect), force teardown after 10s so the call
-        # doesn't hang indefinitely.
-        if callback_armed:
-            async def _safety_timeout() -> None:
-                try:
-                    await asyncio.sleep(10)
-                except asyncio.CancelledError:
-                    return
-                if not _teardown_done:
-                    logger.warning(
-                        "[END_CALL] speech_handle callback didn't fire in 10s; "
-                        "forcing SIP teardown (safety timeout)"
-                    )
-                    await _finish()
-
-            asyncio.create_task(_safety_timeout())
-
-        # ---- PHASE 2: Log to Railway INLINE (immediate, data-safe) ----
-        # Disposition data is persisted before we touch anything else.
-        # Even if the callback never fires, the data is safe.
+        # Resolve room name now (used by notify_call_ended).
         room: rtc.Room | None = None
         if self._ctx is not None:
             room = getattr(self._ctx, "room", None)
         if room is None:
             room = getattr(getattr(session, "room_io", None), "room", None)
         room_name = (room.name if room is not None else "") or ""
+        duration_ms = max(0, int((time.monotonic() - self._call_started_at) * 1000))
 
-        try:
-            await log_verification_to_server(
-                self._phone, status, summary, self._full_name, http=self._http
-            )
-        except Exception as e:
-            logger.error(f"[END_CALL] log_verification_to_server failed: {e}")
-
-        if not self._call_end_notified:
-            duration_ms = max(0, int((time.monotonic() - self._call_started_at) * 1000))
+        async def _do_logging() -> None:
+            """Persist disposition to Railway. Each HTTP call is bounded by 3s."""
             try:
-                await notify_call_ended(
-                    phone=self._phone,
-                    call_id=room_name,
-                    duration_ms=duration_ms,
-                    disconnection_reason=f"agent_end_call:{status}:tool",
-                    http=self._http,
+                await log_verification_to_server(
+                    self._phone, status, summary, self._full_name, http=self._http
                 )
             except Exception as e:
-                logger.error(f"[END_CALL] notify_call_ended failed: {e}")
-            self._call_end_notified = True
+                logger.error(f"[END_CALL] log_verification_to_server failed: {e}")
 
-        # Signal that all HTTP logging is done — _finish() can now safely
-        # proceed to SIP removal and ctx.shutdown() without killing the
-        # http_session out from under an in-flight POST.
-        _logging_complete.set()
+            if not self._call_end_notified:
+                try:
+                    await notify_call_ended(
+                        phone=self._phone,
+                        call_id=room_name,
+                        duration_ms=duration_ms,
+                        disconnection_reason=f"agent_end_call:{status}:tool",
+                        http=self._http,
+                    )
+                except Exception as e:
+                    logger.error(f"[END_CALL] notify_call_ended failed: {e}")
+                self._call_end_notified = True
 
-        # ---- PHASE 3: Fallback if callback couldn't be armed ----
-        if not callback_armed:
-            logger.warning(
-                "[END_CALL] no speech callback available; "
-                "executing SIP teardown inline (closing audio may clip)"
+        async def _wait_closing_audio() -> None:
+            """Wait for the closing-line audio (already streaming) to finish playing.
+
+            RunContext.wait_for_playout waits for the assistant's PRIOR
+            spoken response — i.e., the closing line that landed in the
+            same Realtime turn as this tool call. It deliberately does
+            NOT wait for the tool itself, so there's no deadlock.
+            """
+            try:
+                await ctx.wait_for_playout()
+                logger.info("[END_CALL] closing-line audio playout complete")
+            except RuntimeError as e:
+                # Raised if there's no active generation (model called the
+                # tool with no preceding speech). Acceptable — proceed.
+                logger.info(f"[END_CALL] no closing audio to wait for: {e}")
+            except Exception as e:
+                logger.warning(f"[END_CALL] wait_for_playout failed: {e}")
+
+        # Run logging + wait-for-audio in parallel. Both are bounded
+        # individually (HTTP timeouts ~3s each; closing line is a few
+        # seconds of speech). The 15s outer cap is a safety net in case
+        # something hangs — we'd rather end the call than wait forever.
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(_do_logging(), _wait_closing_audio()),
+                timeout=15.0,
             )
-            await _finish()
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[END_CALL] logging+playout exceeded 15s safety cap; "
+                "proceeding to SIP teardown anyway"
+            )
+
+        # Tiny buffer so the final audio frames flush to the SIP encoder
+        # before the participant is removed and BYE is sent.
+        try:
+            await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
+        # Remove the SIP participant — this is what actually ends the
+        # call from the customer's perspective. By the time control
+        # returns from this tool, the leg is gone, so any follow-up
+        # response the model attempts to generate is a no-op.
+        try:
+            await self._teardown(
+                status, summary, session=session, trigger="tool",
+                skip_logging=True,  # already logged above
+            )
+        except Exception as e:
+            logger.error(f"[END_CALL] teardown failed: {e}")
+
+        # Clean shutdown so the worker doesn't idle until job timeout.
+        # Triggers entrypoint's _cleanup callback (cancels watchdogs,
+        # closes http_session, stops background audio).
+        if self._ctx is not None:
+            try:
+                self._ctx.shutdown(reason=f"agent_end_call:{status}")
+            except Exception as e:
+                logger.warning(f"[END_CALL] ctx.shutdown failed: {e}")
 
         # Return empty string — LLM should produce no follow-up speech.
         return ""
