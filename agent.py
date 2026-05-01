@@ -8,10 +8,12 @@ Architecture (TCN 3-way call):
 
 End-of-call flow:
   1. LLM speaks the closing line (per prompt's CLOSING PROTOCOL)
-  2. LLM calls log_verification tool
-  3. Tool logs disposition to Railway server
-  4. Tool removes SIP participant -> clean BYE to TCN
-  5. TCN sees "Action OK" and routes leg A onward (data dip -> hunt group)
+  2. LLM calls log_verification tool (SAME response — audio still streaming)
+  3. Tool arms speech_handle.done callback, THEN logs to Railway inline
+  4. Closing audio finishes playing → callback fires
+  5. Callback removes SIP participant → clean BYE to TCN
+  6. TCN sees "Action OK" and routes leg A onward (data dip -> hunt group)
+  7. Tool shuts down job context → worker cleanup
 """
 
 import asyncio
@@ -21,6 +23,7 @@ import os
 import re
 import time
 from pathlib import Path
+from typing import Literal
 
 import aiohttp
 from dotenv import load_dotenv
@@ -458,10 +461,15 @@ class VTAAgent(Agent):
         *,
         session: AgentSession,
         trigger: str = "tool",
+        skip_logging: bool = False,
     ) -> None:
         """Common teardown: log disposition, notify call ended, remove SIP participant.
 
         Called by both log_verification (LLM-driven) and force_end_call (system-driven).
+
+        When skip_logging=True, Steps 1-2 (Railway log + notify) are skipped because
+        the caller already did them inline (e.g. log_verification logs immediately so
+        data is never lost, then defers SIP removal to a speech_handle callback).
         """
         room: rtc.Room | None = None
         if self._ctx is not None:
@@ -470,28 +478,29 @@ class VTAAgent(Agent):
             room = getattr(getattr(session, "room_io", None), "room", None)
         room_name = (room.name if room is not None else "") or ""
 
-        # Step 1 — log to the Railway server (Retell-compatible contract)
-        try:
-            await log_verification_to_server(
-                self._phone, status, summary, self._full_name, http=self._http
-            )
-        except Exception as e:
-            logger.error(f"[TEARDOWN] log_verification_to_server failed ({trigger}): {e}")
-
-        # Step 2 — notify call ended
-        if not self._call_end_notified:
-            duration_ms = max(0, int((time.monotonic() - self._call_started_at) * 1000))
+        if not skip_logging:
+            # Step 1 — log to the Railway server (Retell-compatible contract)
             try:
-                await notify_call_ended(
-                    phone=self._phone,
-                    call_id=room_name,
-                    duration_ms=duration_ms,
-                    disconnection_reason=f"agent_end_call:{status}:{trigger}",
-                    http=self._http,
+                await log_verification_to_server(
+                    self._phone, status, summary, self._full_name, http=self._http
                 )
             except Exception as e:
-                logger.error(f"[TEARDOWN] notify_call_ended failed ({trigger}): {e}")
-            self._call_end_notified = True
+                logger.error(f"[TEARDOWN] log_verification_to_server failed ({trigger}): {e}")
+
+            # Step 2 — notify call ended
+            if not self._call_end_notified:
+                duration_ms = max(0, int((time.monotonic() - self._call_started_at) * 1000))
+                try:
+                    await notify_call_ended(
+                        phone=self._phone,
+                        call_id=room_name,
+                        duration_ms=duration_ms,
+                        disconnection_reason=f"agent_end_call:{status}:{trigger}",
+                        http=self._http,
+                    )
+                except Exception as e:
+                    logger.error(f"[TEARDOWN] notify_call_ended failed ({trigger}): {e}")
+                self._call_end_notified = True
 
         # Step 3 — surgical hangup: remove ONLY the SIP participant
         sip_identity = ""
@@ -548,14 +557,38 @@ class VTAAgent(Agent):
     # The LLM has ALREADY spoken the closing line before calling this tool
     # (per the prompt's CLOSING PROTOCOL). This tool just logs the
     # disposition and tears down the SIP leg.
+    #
+    # RACE-CONDITION FIX (ref: Riley agent pattern):
+    #   The closing-line audio and this tool call are part of the SAME
+    #   Realtime response (same speech_handle). Audio is still streaming
+    #   to the customer when the tool fires. If we remove the SIP
+    #   participant inline, the audio gets cut off mid-sentence.
+    #
+    #   Solution — three-phase lifecycle:
+    #     Phase 1: Arm speech_handle.add_done_callback FIRST (before any
+    #              I/O) so the call WILL end even if the HTTP POST hangs.
+    #     Phase 2: Log disposition to Railway INLINE (data must never be
+    #              lost). Signal _logging_complete when done.
+    #     Phase 3: (in callback) Wait for _logging_complete, THEN remove
+    #              SIP participant, THEN shut down the job context.
+    #
+    #   Safety net: 10s timeout fires teardown if the callback never does.
     # ------------------------------------------------------------------
     @function_tool()
     async def log_verification(
         self,
         context: RunContext,
-        status: str,
-        summary: str,
-        full_name: str,
+        status: Literal[
+            "verified",
+            "wrong_number",
+            "third_party_end",
+            "consumer_busy_end",
+            "dnc",
+            "customer_wants_human",
+            "other",
+        ],
+        summary: str = "",
+        full_name: str = "",
     ) -> str:
         """Log the call disposition and end the call.
 
@@ -588,9 +621,139 @@ class VTAAgent(Agent):
             f"summary={summary!r} full_name={full_name!r}"
         )
 
-        await self._teardown(
-            status, summary, session=context.session, trigger="tool"
-        )
+        session = context.session
+
+        # Coordination event: _finish() waits on this before touching the
+        # SIP leg, so the http_session is never closed out from under an
+        # in-flight POST.
+        _logging_complete = asyncio.Event()
+        _teardown_done = False
+
+        async def _finish() -> None:
+            """SIP teardown + job shutdown — runs exactly once.
+
+            Called from either the speech_handle callback (normal path) or
+            the safety timeout (fallback). Guarded by _teardown_done flag.
+            """
+            nonlocal _teardown_done
+            if _teardown_done:
+                return
+            _teardown_done = True
+
+            # Wait for the inline HTTP logging to complete before we touch
+            # the session/room — ctx.shutdown() would close the http_session.
+            try:
+                await asyncio.wait_for(_logging_complete.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[END_CALL] logging didn't complete in 5s; "
+                    "proceeding with SIP teardown anyway"
+                )
+
+            logger.info(
+                "[END_CALL] executing deferred SIP teardown "
+                "(closing audio has finished playing)"
+            )
+
+            # SIP removal — sends clean BYE to TCN
+            try:
+                await self._teardown(
+                    status, summary, session=session, trigger="tool",
+                    skip_logging=True,  # already logged inline
+                )
+            except Exception as e:
+                logger.error(f"[END_CALL] deferred SIP teardown failed: {e}")
+
+            # Clean shutdown so the worker doesn't idle until job timeout.
+            # Triggers entrypoint's _cleanup callback (cancels watchdogs,
+            # closes http_session, stops background audio).
+            if self._ctx is not None:
+                try:
+                    self._ctx.shutdown(reason=f"agent_end_call:{status}")
+                except Exception as e:
+                    logger.warning(f"[END_CALL] ctx.shutdown failed: {e}")
+
+        # ---- PHASE 1: Arm shutdown callbacks BEFORE the HTTP POST ----
+        # Even if the POST hangs for its full 3s timeout, the call will
+        # still end as soon as the closing audio finishes playing.
+        callback_armed = False
+        try:
+            def _on_speech_done(_) -> None:
+                asyncio.ensure_future(_finish())
+
+            context.speech_handle.add_done_callback(_on_speech_done)
+            callback_armed = True
+            logger.info(
+                "[END_CALL] SIP teardown deferred — armed on speech_handle.done "
+                "(customer will hear full closing line before BYE)"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[END_CALL] speech_handle.add_done_callback unavailable ({e}); "
+                "will fall back to inline teardown after logging"
+            )
+
+        # Safety timeout — if the speech_handle callback never fires (e.g.
+        # Realtime WS disconnect), force teardown after 10s so the call
+        # doesn't hang indefinitely.
+        if callback_armed:
+            async def _safety_timeout() -> None:
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    return
+                if not _teardown_done:
+                    logger.warning(
+                        "[END_CALL] speech_handle callback didn't fire in 10s; "
+                        "forcing SIP teardown (safety timeout)"
+                    )
+                    await _finish()
+
+            asyncio.create_task(_safety_timeout())
+
+        # ---- PHASE 2: Log to Railway INLINE (immediate, data-safe) ----
+        # Disposition data is persisted before we touch anything else.
+        # Even if the callback never fires, the data is safe.
+        room: rtc.Room | None = None
+        if self._ctx is not None:
+            room = getattr(self._ctx, "room", None)
+        if room is None:
+            room = getattr(getattr(session, "room_io", None), "room", None)
+        room_name = (room.name if room is not None else "") or ""
+
+        try:
+            await log_verification_to_server(
+                self._phone, status, summary, self._full_name, http=self._http
+            )
+        except Exception as e:
+            logger.error(f"[END_CALL] log_verification_to_server failed: {e}")
+
+        if not self._call_end_notified:
+            duration_ms = max(0, int((time.monotonic() - self._call_started_at) * 1000))
+            try:
+                await notify_call_ended(
+                    phone=self._phone,
+                    call_id=room_name,
+                    duration_ms=duration_ms,
+                    disconnection_reason=f"agent_end_call:{status}:tool",
+                    http=self._http,
+                )
+            except Exception as e:
+                logger.error(f"[END_CALL] notify_call_ended failed: {e}")
+            self._call_end_notified = True
+
+        # Signal that all HTTP logging is done — _finish() can now safely
+        # proceed to SIP removal and ctx.shutdown() without killing the
+        # http_session out from under an in-flight POST.
+        _logging_complete.set()
+
+        # ---- PHASE 3: Fallback if callback couldn't be armed ----
+        if not callback_armed:
+            logger.warning(
+                "[END_CALL] no speech callback available; "
+                "executing SIP teardown inline (closing audio may clip)"
+            )
+            await _finish()
 
         # Return empty string — LLM should produce no follow-up speech.
         return ""
@@ -646,6 +809,13 @@ class VTAAgent(Agent):
         await self._teardown(
             status, summary, session=session, trigger="system"
         )
+
+        # Clean shutdown so the worker doesn't idle until job timeout.
+        if self._ctx is not None:
+            try:
+                self._ctx.shutdown(reason=f"agent_end_call:{status}")
+            except Exception as e:
+                logger.warning(f"[END_CALL] ctx.shutdown failed (system path): {e}")
 
 
 # ---------------------------------------------------------------------------
