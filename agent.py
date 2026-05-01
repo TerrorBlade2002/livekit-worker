@@ -1112,6 +1112,89 @@ async def entrypoint(ctx: agents.JobContext):
                 logger.exception(f"[SILENCE] user_state_changed handler failed: {e}")
 
         # ------------------------------------------------------------------
+        # Tool-call nudge — fallback for when the xAI Realtime model
+        # generates closing speech but doesn't call log_verification
+        # in the same response turn.
+        #
+        # After the agent finishes speaking, we wait TOOL_NUDGE_DELAY
+        # seconds. If the user hasn't spoken and the tool hasn't been
+        # called, we programmatically trigger a generate_reply that
+        # instructs the model to call the tool NOW. This turns a 6-7s
+        # freeze (waiting for user input) into a ~2s auto-recovery.
+        # ------------------------------------------------------------------
+        TOOL_NUDGE_DELAY = float(os.getenv("TOOL_NUDGE_DELAY", "1.5"))
+        _nudge_task: asyncio.Task | None = None
+
+        @session.on("agent_state_changed")
+        def on_agent_state(ev) -> None:
+            nonlocal _nudge_task
+            try:
+                if vta_agent._ending:
+                    return
+                new_state = getattr(ev, "new_state", None)
+                if new_state == "listening":
+                    # Agent finished speaking — arm the nudge timer.
+                    # If the model called log_verification in the same turn,
+                    # _ending is already True and we skip above. Otherwise the
+                    # timer gives the model TOOL_NUDGE_DELAY seconds before we
+                    # force a follow-up response.
+                    if _nudge_task is not None and not _nudge_task.done():
+                        _nudge_task.cancel()
+
+                    async def _nudge_tool_call() -> None:
+                        try:
+                            await asyncio.sleep(TOOL_NUDGE_DELAY)
+                        except asyncio.CancelledError:
+                            return
+                        if vta_agent._ending:
+                            return
+                        # Don't nudge while the user is actively speaking
+                        current_user_state = getattr(session, "user_state", "listening")
+                        if current_user_state == "speaking":
+                            return
+                        # Don't nudge in the first 10s of the call (opening exchange)
+                        elapsed = time.monotonic() - vta_agent._call_started_at
+                        if elapsed < 10.0:
+                            return
+                        logger.info(
+                            "[NUDGE] agent spoke but tool not called after "
+                            f"{TOOL_NUDGE_DELAY}s — nudging model to call "
+                            "log_verification if appropriate"
+                        )
+                        try:
+                            await session.generate_reply(
+                                instructions=(
+                                    "If your very last spoken response was a closing "
+                                    "or farewell line (e.g. goodbye, transfer, have a "
+                                    "nice day), you MUST call log_verification now with "
+                                    "the appropriate status and summary. Do not speak "
+                                    "again — just call the function."
+                                ),
+                            )
+                        except Exception as e:
+                            logger.warning(f"[NUDGE] generate_reply failed: {e}")
+
+                    _nudge_task = asyncio.create_task(_nudge_tool_call())
+
+                elif new_state in ("speaking", "thinking"):
+                    # Agent is generating a new response — cancel any pending nudge
+                    if _nudge_task is not None and not _nudge_task.done():
+                        _nudge_task.cancel()
+                        _nudge_task = None
+            except Exception as e:
+                logger.exception(f"[NUDGE] agent_state_changed handler failed: {e}")
+
+        # Also cancel the nudge when the user starts speaking — normal
+        # conversation turn, no nudge needed.
+        @session.on("user_state_changed")
+        def on_user_state_nudge_cancel(ev) -> None:
+            nonlocal _nudge_task
+            new_state = getattr(ev, "new_state", None)
+            if new_state == "speaking" and _nudge_task is not None and not _nudge_task.done():
+                _nudge_task.cancel()
+                _nudge_task = None
+
+        # ------------------------------------------------------------------
         # Max call duration watchdog
         # ------------------------------------------------------------------
         async def _max_duration_watchdog(duration: float) -> None:
@@ -1184,6 +1267,9 @@ async def entrypoint(ctx: agents.JobContext):
             # Cancel the max-duration watchdog
             if not max_duration_task.done():
                 max_duration_task.cancel()
+            # Cancel any pending tool nudge
+            if _nudge_task is not None and not _nudge_task.done():
+                _nudge_task.cancel()
             # Cancel any pending silence hangup
             hangup_task = silence_state.get("hangup_task")
             if hangup_task is not None and not hangup_task.done():
