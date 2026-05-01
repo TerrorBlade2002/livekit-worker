@@ -8,7 +8,9 @@ Architecture (TCN 3-way call):
 
 End-of-call flow:
   1. LLM speaks the closing line (per prompt's CLOSING PROTOCOL)
-  2. LLM calls log_verification tool (SAME response — audio still streaming)
+  2. LLM calls log_verification tool (SAME response turn — audio still streaming)
+     (auto-discovered @function_tool with Pydantic strict schema ensures the model
+      generates closing speech + tool call in ONE turn, not two)
   3. Tool arms speech_handle.done callback, THEN logs to Railway inline
   4. Closing audio finishes playing → callback fires
   5. Callback removes SIP participant → clean BYE to TCN
@@ -23,9 +25,10 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Literal
 
 import aiohttp
+from pydantic import Field
 from dotenv import load_dotenv
 from livekit import agents, api, rtc
 from livekit.agents import (
@@ -39,7 +42,6 @@ from livekit.agents import (
     function_tool,
     metrics,
 )
-from livekit.agents.llm import Toolset
 from livekit.agents.voice import room_io
 from livekit.plugins import xai as xai_plugin
 
@@ -121,60 +123,6 @@ SYSTEM_CLOSING_OTHER = (
 )
 
 TCN_TRANSFER_STATUSES = {"verified", "customer_wants_human"}
-
-# ---------------------------------------------------------------------------
-# Tool schema — explicit raw_schema so the Realtime model gets EXACTLY the
-# right function definition. Auto-generated schemas from @function_tool()
-# can produce formats the xAI Realtime model doesn't handle cleanly (e.g.
-# narrating the tool call aloud, or not triggering the call at all).
-#
-# Key line: "Do not produce any further speech once this is called."
-# Without it, the Realtime model will speak the function call parameters.
-# ---------------------------------------------------------------------------
-_LOG_VERIFICATION_SCHEMA: dict[str, Any] = {
-    "type": "function",
-    "name": "log_verification",
-    "description": (
-        "Log the disposition status before ending the call along with a brief "
-        "description of what happened and the reason for disposing of a particular "
-        "status, then immediately end the call. This is the ONLY way to end the "
-        "call — always call this AFTER speaking the closing line, never before. "
-        "Do not produce any further speech once this is called."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "status": {
-                "type": "string",
-                "description": "Disposition based on conversation situation",
-                "enum": [
-                    "verified",
-                    "wrong_number",
-                    "third_party_end",
-                    "consumer_busy_end",
-                    "dnc",
-                    "customer_wants_human",
-                    "other",
-                ],
-            },
-            "summary": {
-                "type": "string",
-                "description": (
-                    "Brief description of what happened on the call, including if "
-                    "any callback information exchanges like call back number or "
-                    "time provided by the consumer, and the reason for the "
-                    "disposition status."
-                ),
-            },
-            "full_name": {
-                "type": "string",
-                "description": "Customer's name",
-            },
-        },
-        "required": ["status"],
-    },
-}
-
 
 # ---------------------------------------------------------------------------
 # Observability — Timeline helper
@@ -411,31 +359,6 @@ async def log_verification_to_server(
 
 
 # ---------------------------------------------------------------------------
-# LogVerificationToolset — wraps the log_verification tool in a Toolset
-# so Agent.__init__ registers it properly (Agent.tools expects Toolset
-# instances, not raw function_tool objects).
-#
-# This is a thin delegation wrapper — all logic lives in VTAAgent._log_verification.
-# Pattern mirrors the reference agent's MarkDispositionAndEndCallTool.
-# ---------------------------------------------------------------------------
-class LogVerificationToolset(Toolset):
-    """Wraps log_verification with raw_schema and delegates to the VTAAgent."""
-
-    def __init__(self, agent: "VTAAgent") -> None:
-        self._agent = agent
-        tool = function_tool(
-            self._execute,
-            raw_schema=_LOG_VERIFICATION_SCHEMA,
-        )
-        super().__init__(id="log_verification", tools=[tool])
-
-    async def _execute(
-        self, raw_arguments: dict[str, object], ctx: RunContext
-    ) -> str:
-        return await self._agent._log_verification(raw_arguments, ctx)
-
-
-# ---------------------------------------------------------------------------
 # VTAAgent — Virtual Transfer Agent
 #
 # End-call architecture:
@@ -485,12 +408,10 @@ class VTAAgent(Agent):
             .replace("{call_back_number}", call_back_number)
         )
 
-        # Register the tool via a Toolset wrapper (Agent.__init__ expects
-        # Toolset instances, not raw function_tool objects). The Toolset
-        # delegates to self._log_verification which has all the teardown logic.
+        # Tools are auto-discovered from @function_tool() decorated methods
+        # on this class via find_function_tools(self) — no explicit tools= needed.
         super().__init__(
             instructions=instructions,
-            tools=[LogVerificationToolset(self)],
         )
         self._full_name = full_name
 
@@ -639,6 +560,11 @@ class VTAAgent(Agent):
     # ------------------------------------------------------------------
     # LLM-driven end-call: log_verification tool
     #
+    # Auto-discovered by the Agent framework via @function_tool() decorator.
+    # Generates a FunctionTool with Pydantic schema (strict mode) which
+    # the xAI Realtime model handles correctly — calling the tool in the
+    # SAME response turn as the closing speech.
+    #
     # The LLM has ALREADY spoken the closing line before calling this tool
     # (per the prompt's CLOSING PROTOCOL). This tool just logs the
     # disposition and tears down the SIP leg.
@@ -659,22 +585,48 @@ class VTAAgent(Agent):
     #
     #   Safety net: 10s timeout fires teardown if the callback never does.
     # ------------------------------------------------------------------
-    async def _log_verification(
+    @function_tool(
+        description=(
+            "Log the disposition status before ending the call along with a brief "
+            "description of what happened and the reason for disposing of a particular "
+            "status, then immediately end the call. This is the ONLY way to end the "
+            "call — always call this AFTER speaking the closing line, never before. "
+            "Do not produce any further speech once this is called."
+        ),
+    )
+    async def log_verification(
         self,
-        raw_arguments: dict[str, object],
         ctx: RunContext,
+        status: Annotated[
+            Literal[
+                "verified",
+                "wrong_number",
+                "third_party_end",
+                "consumer_busy_end",
+                "dnc",
+                "customer_wants_human",
+                "other",
+            ],
+            Field(description="Disposition based on conversation situation"),
+        ],
+        summary: Annotated[
+            str,
+            Field(
+                default="",
+                description=(
+                    "Brief description of what happened on the call, including if "
+                    "any callback information exchanges like call back number or "
+                    "time provided by the consumer, and the reason for the "
+                    "disposition status."
+                ),
+            ),
+        ] = "",
+        full_name: Annotated[
+            str,
+            Field(default="", description="Customer's name"),
+        ] = "",
     ) -> str:
-        """Tool implementation — called by the framework with raw_schema args.
-
-        Registered via function_tool(raw_schema=_LOG_VERIFICATION_SCHEMA) in
-        __init__, NOT via @function_tool() decorator. This ensures the Realtime
-        model gets the exact schema (with "Do not produce any further speech")
-        and never narrates the function call aloud.
-        """
-        # Extract parameters from the raw JSON dict (reference pattern)
-        status = str(raw_arguments.get("status", "other"))
-        summary = str(raw_arguments.get("summary") or "")
-        full_name = str(raw_arguments.get("full_name") or "")
+        """Log the disposition and end the call. Do not produce any further speech."""
 
         if self._ending:
             logger.warning("[END_CALL] already ending — duplicate tool call ignored")
