@@ -23,7 +23,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Literal
+from typing import Any
 
 import aiohttp
 from dotenv import load_dotenv
@@ -120,6 +120,59 @@ SYSTEM_CLOSING_OTHER = (
 )
 
 TCN_TRANSFER_STATUSES = {"verified", "customer_wants_human"}
+
+# ---------------------------------------------------------------------------
+# Tool schema — explicit raw_schema so the Realtime model gets EXACTLY the
+# right function definition. Auto-generated schemas from @function_tool()
+# can produce formats the xAI Realtime model doesn't handle cleanly (e.g.
+# narrating the tool call aloud, or not triggering the call at all).
+#
+# Key line: "Do not produce any further speech once this is called."
+# Without it, the Realtime model will speak the function call parameters.
+# ---------------------------------------------------------------------------
+_LOG_VERIFICATION_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "name": "log_verification",
+    "description": (
+        "Log the disposition status before ending the call along with a brief "
+        "description of what happened and the reason for disposing of a particular "
+        "status, then immediately end the call. This is the ONLY way to end the "
+        "call — always call this AFTER speaking the closing line, never before. "
+        "Do not produce any further speech once this is called."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "description": "Disposition based on conversation situation",
+                "enum": [
+                    "verified",
+                    "wrong_number",
+                    "third_party_end",
+                    "consumer_busy_end",
+                    "dnc",
+                    "customer_wants_human",
+                    "other",
+                ],
+            },
+            "summary": {
+                "type": "string",
+                "description": (
+                    "Brief description of what happened on the call, including if "
+                    "any callback information exchanges like call back number or "
+                    "time provided by the consumer, and the reason for the "
+                    "disposition status."
+                ),
+            },
+            "full_name": {
+                "type": "string",
+                "description": "Customer's name",
+            },
+        },
+        "required": ["status"],
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +459,14 @@ class VTAAgent(Agent):
             .replace("{call_back_number}", call_back_number)
         )
 
-        super().__init__(instructions=instructions)
+        # Register the tool with an explicit raw_schema so the Realtime
+        # model gets the exact function definition (including "Do not produce
+        # any further speech once this is called.").
+        _tool = function_tool(
+            self._log_verification,
+            raw_schema=_LOG_VERIFICATION_SCHEMA,
+        )
+        super().__init__(instructions=instructions, tools=[_tool])
         self._full_name = full_name
 
     async def on_enter(self):
@@ -574,36 +634,23 @@ class VTAAgent(Agent):
     #
     #   Safety net: 10s timeout fires teardown if the callback never does.
     # ------------------------------------------------------------------
-    @function_tool()
-    async def log_verification(
+    async def _log_verification(
         self,
-        context: RunContext,
-        status: Literal[
-            "verified",
-            "wrong_number",
-            "third_party_end",
-            "consumer_busy_end",
-            "dnc",
-            "customer_wants_human",
-            "other",
-        ],
-        summary: str = "",
-        full_name: str = "",
+        raw_arguments: dict[str, object],
+        ctx: RunContext,
     ) -> str:
-        """Log the call disposition and end the call.
+        """Tool implementation — called by the framework with raw_schema args.
 
-        Called AFTER the closing line has been spoken. Logs the outcome to the
-        Railway server and tears down the SIP leg so TCN can route the customer
-        onward (data dip -> hunt group for verified/customer_wants_human, clean
-        disconnect for everything else).
-
-        Args:
-            status: The verification outcome. Must be one of:
-                "verified", "wrong_number", "third_party_end",
-                "consumer_busy_end", "dnc", "customer_wants_human", "other"
-            summary: Brief one-line description of what happened during the call.
-            full_name: The customer's name.
+        Registered via function_tool(raw_schema=_LOG_VERIFICATION_SCHEMA) in
+        __init__, NOT via @function_tool() decorator. This ensures the Realtime
+        model gets the exact schema (with "Do not produce any further speech")
+        and never narrates the function call aloud.
         """
+        # Extract parameters from the raw JSON dict (reference pattern)
+        status = str(raw_arguments.get("status", "other"))
+        summary = str(raw_arguments.get("summary") or "")
+        full_name = str(raw_arguments.get("full_name") or "")
+
         if self._ending:
             logger.warning("[END_CALL] already ending — duplicate tool call ignored")
             return ""
@@ -612,7 +659,7 @@ class VTAAgent(Agent):
 
         # Prevent user speech from interrupting the teardown sequence
         try:
-            context.disallow_interruptions()
+            ctx.disallow_interruptions()
         except Exception as e:
             logger.warning(f"disallow_interruptions failed (continuing): {e}")
 
@@ -621,7 +668,7 @@ class VTAAgent(Agent):
             f"summary={summary!r} full_name={full_name!r}"
         )
 
-        session = context.session
+        session = ctx.session
 
         # Coordination event: _finish() waits on this before touching the
         # SIP leg, so the http_session is never closed out from under an
@@ -681,7 +728,7 @@ class VTAAgent(Agent):
             def _on_speech_done(_) -> None:
                 asyncio.ensure_future(_finish())
 
-            context.speech_handle.add_done_callback(_on_speech_done)
+            ctx.speech_handle.add_done_callback(_on_speech_done)
             callback_armed = True
             logger.info(
                 "[END_CALL] SIP teardown deferred — armed on speech_handle.done "
