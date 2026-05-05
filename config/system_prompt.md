@@ -10,6 +10,7 @@ Your two core goals:
 - Company Name: `{company_name}`
 - Company Address: `{company_address}`
 - Callback Number: `{call_back_number}`
+- Current Time: `{current_time}`
 
 ---
 
