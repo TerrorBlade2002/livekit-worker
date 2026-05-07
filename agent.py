@@ -10,8 +10,10 @@ End-of-call flow (deterministic, no callbacks):
   1. LLM speaks the closing line (per prompt's CLOSING PROTOCOL)
   2. LLM calls log_verification tool
   3. Tool: disallow_interruptions
-  4. Tool: await ctx.wait_for_playout() — closing audio drains fully
-  5. Tool: 300ms buffer for SIP encoder to flush last frames
+  4. Tool: asyncio.sleep(1.5) — fixed delay for closing audio to stream
+     (ctx.wait_for_playout() HANGS with xAI Realtime — generation
+      future never resolves, so we use a deterministic delay instead)
+  5. Tool: session.aclose() — kills Realtime WebSocket, no more speech
   6. Tool: fire Railway HTTP logging in background (non-blocking)
   7. Tool: remove SIP participant → BYE to TCN
   8. Tool: job_ctx.shutdown() → worker cleanup
@@ -234,9 +236,9 @@ async def _fire_railway_log(
 #
 # Sequence inside the tool:
 #   1. disallow_interruptions
-#   2. await ctx.wait_for_playout() — closing audio drains
-#   3. 300ms buffer — SIP encoder flushes last frames
-#   4. asyncio.create_task(railway logging) — non-blocking
+#   2. asyncio.sleep(1.5) — fixed delay for closing audio to stream
+#   3. fire railway logging (non-blocking)
+#   4. session.aclose() — kill Realtime WS
 #   5. remove SIP participant — BYE to TCN
 #   6. job_ctx.shutdown()
 #   7. return ""
@@ -294,6 +296,7 @@ class LogVerificationTool(Toolset):
         self._sip_identity = sip_identity
         self._http = http
         self._ending = False
+        self._session: AgentSession | None = None  # set after session.start()
 
     async def _log_verification(
         self, raw_arguments: dict[str, object], ctx: RunContext,
@@ -314,22 +317,15 @@ class LogVerificationTool(Toolset):
         except Exception:
             pass
 
-        # 2. Wait for the closing-line audio to finish playing.
-        #    ctx.wait_for_playout() waits for the speech BEFORE this tool,
-        #    not the full turn — no circular wait.
-        try:
-            await ctx.wait_for_playout()
-            logger.info("[END_CALL] closing audio playout complete")
-        except Exception as e:
-            # RuntimeError if no prior speech, or other edge cases.
-            # Proceed anyway — ending the call is more important.
-            logger.info(f"[END_CALL] wait_for_playout: {e}")
+        # 2. Fixed delay — let the closing-line audio play out.
+        #    ctx.wait_for_playout() HANGS with xAI Realtime because the
+        #    generation future (_wait_for_generation) never resolves.
+        #    A deterministic 1.5s covers a typical 2-3s closing phrase
+        #    (audio is already streaming while the tool runs).
+        await asyncio.sleep(1.5)
+        logger.info("[END_CALL] 1.5s playout delay done")
 
-        # 3. Small buffer so the final audio frames flush through the
-        #    SIP encoder before we remove the participant.
-        await asyncio.sleep(0.3)
-
-        # 4. Fire Railway logging in background — non-blocking.
+        # 3. Fire Railway logging in background — non-blocking.
         #    We don't wait on this; the call ends whether or not the
         #    HTTP calls succeed.
         job_ctx = get_job_context()
@@ -338,6 +334,15 @@ class LogVerificationTool(Toolset):
             self._phone, status, summary, full_name,
             self._call_started_at, room_name, self._http,
         ))
+
+        # 4. Kill the Realtime WebSocket — prevents model from generating
+        #    any follow-up speech after the closing line.
+        if self._session is not None:
+            try:
+                await self._session.aclose()
+                logger.info("[END_CALL] session closed — Realtime WS killed")
+            except Exception as e:
+                logger.info(f"[END_CALL] session.aclose: {e}")
 
         # 5. Remove SIP participant — this is the BYE to TCN.
         #    The call is OVER after this line executes.
@@ -407,44 +412,20 @@ async def entrypoint(ctx: JobContext):
 
     try:
         # ------------------------------------------------------------------
-        # SIP participant discovery
+        # 1. INSTANT: Extract phone from room name (vta-call-<phone>)
+        #    This is free — no network, no participant wait.
         # ------------------------------------------------------------------
         phone = ""
         sip_identity = ""
         linked_identity = ""
 
-        def refresh_sip_context() -> None:
-            nonlocal phone, sip_identity, linked_identity
-            sip_p = find_primary_sip_participant(ctx.room, preferred_identity=sip_identity)
-            if sip_p is not None:
-                sip_identity = sip_p.identity or sip_identity
-                linked_identity = sip_identity or linked_identity
-                extracted = extract_phone_from_participant(sip_p)
-                if extracted:
-                    nonlocal phone
-                    phone = extracted
-                return
-            for p in ctx.room.remote_participants.values():
-                if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD:
-                    linked_identity = p.identity or linked_identity
-                    break
+        # Room name contains phone: vta-call-<digits>
+        m = re.search(r"(\d{10,})", ctx.room.name)
+        if m:
+            phone = normalize_phone(m.group(1))
+            logger.info(f"Phone from room name: {phone}")
 
-        refresh_sip_context()
-
-        if not phone and not linked_identity:
-            participant_ev = asyncio.Event()
-
-            @ctx.room.on("participant_connected")
-            def _on_p(p: rtc.RemoteParticipant):
-                refresh_sip_context()
-                if phone or linked_identity:
-                    participant_ev.set()
-
-            try:
-                await asyncio.wait_for(participant_ev.wait(), timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.warning("No SIP participant within 10s")
-
+        # Also check job metadata
         if not phone and ctx.job.metadata:
             try:
                 meta = json.loads(ctx.job.metadata)
@@ -452,20 +433,10 @@ async def entrypoint(ctx: JobContext):
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        if not phone:
-            m = re.search(r"(\d{10,})", ctx.room.name)
-            if m:
-                phone = normalize_phone(m.group(1))
-
-        logger.info(f"Caller phone: {phone}")
-
         # ------------------------------------------------------------------
-        # Fetch full_name from Railway + build model IN PARALLEL
-        # (only full_name comes from server; other vars are always .env defaults)
+        # 2. PARALLEL: Build Grok model + fetch full_name from Railway
+        #    Both happen while we wait for SIP participant.
         # ------------------------------------------------------------------
-        name_task = asyncio.create_task(fetch_full_name(phone, http_session)) if phone else None
-
-        # Build Grok Realtime model while webhook runs
         model_kwargs: dict = {"voice": GROK_VOICE}
         if GROK_REALTIME_MODEL:
             model_kwargs["model"] = GROK_REALTIME_MODEL
@@ -475,7 +446,49 @@ async def entrypoint(ctx: JobContext):
         except TypeError:
             rt_model = xai_plugin.realtime.RealtimeModel(voice=GROK_VOICE)
 
-        # Now collect the name (webhook should be done by now)
+        name_task = asyncio.create_task(fetch_full_name(phone, http_session)) if phone else None
+
+        # ------------------------------------------------------------------
+        # 3. SIP participant discovery (short timeout — 3s, not 10s)
+        #    We already have the phone from room name; this just gets
+        #    the SIP identity for later removal.
+        # ------------------------------------------------------------------
+        def refresh_sip_context() -> None:
+            nonlocal phone, sip_identity, linked_identity
+            sip_p = find_primary_sip_participant(ctx.room, preferred_identity=sip_identity)
+            if sip_p is not None:
+                sip_identity = sip_p.identity or sip_identity
+                linked_identity = sip_identity or linked_identity
+                extracted = extract_phone_from_participant(sip_p)
+                if extracted:
+                    phone = extracted
+                return
+            for p in ctx.room.remote_participants.values():
+                if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD:
+                    linked_identity = p.identity or linked_identity
+                    break
+
+        refresh_sip_context()
+
+        if not sip_identity and not linked_identity:
+            participant_ev = asyncio.Event()
+
+            @ctx.room.on("participant_connected")
+            def _on_p(p: rtc.RemoteParticipant):
+                refresh_sip_context()
+                if sip_identity or linked_identity:
+                    participant_ev.set()
+
+            try:
+                await asyncio.wait_for(participant_ev.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                logger.warning("No SIP participant within 3s — proceeding anyway")
+
+        logger.info(f"Caller phone: {phone} | SIP identity: {sip_identity}")
+
+        # ------------------------------------------------------------------
+        # 4. Collect full_name (webhook should be done by now)
+        # ------------------------------------------------------------------
         full_name = DEFAULT_FULL_NAME
         if name_task is not None:
             try:
@@ -528,6 +541,9 @@ async def entrypoint(ctx: JobContext):
             )
 
         await session.start(agent=vta_agent, room=ctx.room, room_options=room_opts)
+
+        # Wire session into tool so it can kill the Realtime WS on end-call
+        log_tool._session = session
 
         # Update SIP identity after session links
         lp = getattr(getattr(session, "room_io", None), "linked_participant", None)
