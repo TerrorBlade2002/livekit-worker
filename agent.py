@@ -11,13 +11,13 @@ End-of-call flow (deterministic, no callbacks):
   2. LLM calls log_verification tool
   3. Tool: disallow_interruptions
   4. Tool: asyncio.sleep(1.5) — fixed delay for closing audio to stream
-     (ctx.wait_for_playout() HANGS with xAI Realtime — generation
-      future never resolves, so we use a deterministic delay instead)
-  5. Tool: session.aclose() — kills Realtime WebSocket, no more speech
+  5. Tool: remove SIP participant → BYE to TCN (ACTUAL call end)
   6. Tool: fire Railway HTTP logging in background (non-blocking)
-  7. Tool: remove SIP participant → BYE to TCN
-  8. Tool: job_ctx.shutdown() → worker cleanup
-  9. Tool: return "" (SIP is already gone — model can't speak to anyone)
+  7. Tool: job_ctx.shutdown() → worker cleanup
+  8. Tool: return "" (SIP is already gone — model can't speak to anyone)
+
+  NOTE: Do NOT call session.aclose() from inside this tool — it
+  deadlocks because the session is waiting for the tool to return.
 """
 
 import asyncio
@@ -237,11 +237,13 @@ async def _fire_railway_log(
 # Sequence inside the tool:
 #   1. disallow_interruptions
 #   2. asyncio.sleep(1.5) — fixed delay for closing audio to stream
-#   3. fire railway logging (non-blocking)
-#   4. session.aclose() — kill Realtime WS
-#   5. remove SIP participant — BYE to TCN
-#   6. job_ctx.shutdown()
-#   7. return ""
+#   3. remove SIP participant — BYE to TCN (actual call end)
+#   4. fire railway logging (non-blocking)
+#   5. job_ctx.shutdown()
+#   6. return ""
+#
+# IMPORTANT: Do NOT call session.aclose() here — deadlocks because
+# the session is waiting for this tool to return.
 # ---------------------------------------------------------------------------
 _LOG_VERIFICATION_SCHEMA: dict[str, Any] = {
     "type": "function",
@@ -296,7 +298,6 @@ class LogVerificationTool(Toolset):
         self._sip_identity = sip_identity
         self._http = http
         self._ending = False
-        self._session: AgentSession | None = None  # set after session.start()
 
     async def _log_verification(
         self, raw_arguments: dict[str, object], ctx: RunContext,
@@ -318,34 +319,19 @@ class LogVerificationTool(Toolset):
             pass
 
         # 2. Fixed delay — let the closing-line audio play out.
-        #    ctx.wait_for_playout() HANGS with xAI Realtime because the
-        #    generation future (_wait_for_generation) never resolves.
-        #    A deterministic 1.5s covers a typical 2-3s closing phrase
-        #    (audio is already streaming while the tool runs).
+        #    ctx.wait_for_playout() HANGS with xAI Realtime (generation
+        #    future never resolves). 1.5s lets most of the closing phrase
+        #    stream before we cut the SIP leg.
         await asyncio.sleep(1.5)
         logger.info("[END_CALL] 1.5s playout delay done")
 
-        # 3. Fire Railway logging in background — non-blocking.
-        #    We don't wait on this; the call ends whether or not the
-        #    HTTP calls succeed.
+        # 3. REMOVE SIP PARTICIPANT IMMEDIATELY — this is the BYE to TCN.
+        #    This is THE action that actually ends the call. Everything
+        #    after this is just housekeeping.
+        #    NOTE: Do NOT call session.aclose() before this — it deadlocks
+        #    because the session is waiting for THIS tool to return.
         job_ctx = get_job_context()
         room_name = (job_ctx.room.name if job_ctx.room else "") or ""
-        asyncio.create_task(_fire_railway_log(
-            self._phone, status, summary, full_name,
-            self._call_started_at, room_name, self._http,
-        ))
-
-        # 4. Kill the Realtime WebSocket — prevents model from generating
-        #    any follow-up speech after the closing line.
-        if self._session is not None:
-            try:
-                await self._session.aclose()
-                logger.info("[END_CALL] session closed — Realtime WS killed")
-            except Exception as e:
-                logger.info(f"[END_CALL] session.aclose: {e}")
-
-        # 5. Remove SIP participant — this is the BYE to TCN.
-        #    The call is OVER after this line executes.
         removed = False
         if room_name and self._sip_identity:
             try:
@@ -355,7 +341,7 @@ class LogVerificationTool(Toolset):
                     )
                 )
                 removed = True
-                logger.info(f"[END_CALL] SIP {self._sip_identity} removed — BYE to TCN")
+                logger.info(f"[END_CALL] SIP {self._sip_identity} removed — BYE sent to TCN")
             except Exception as e:
                 logger.warning(f"[END_CALL] remove_participant failed: {e}")
 
@@ -366,14 +352,21 @@ class LogVerificationTool(Toolset):
             except Exception as e:
                 logger.error(f"[END_CALL] delete_room failed: {e}")
 
-        # 6. Shut down the job so the worker doesn't idle.
+        # 4. Fire Railway logging in background — non-blocking.
+        asyncio.create_task(_fire_railway_log(
+            self._phone, status, summary, full_name,
+            self._call_started_at, room_name, self._http,
+        ))
+
+        # 5. Shut down the job. This cleans up the session, Realtime WS,
+        #    and worker resources. Even if the model generates follow-up
+        #    speech, the SIP participant is already gone — no one hears it.
         try:
             job_ctx.shutdown(reason=f"agent_end_call:{status}")
         except Exception:
             pass
 
-        # 7. Return empty string. By now the SIP leg is gone — even if the
-        #    model tries to generate a follow-up, there's no one to hear it.
+        # 6. Return empty string.
         return ""
 
 
@@ -541,9 +534,6 @@ async def entrypoint(ctx: JobContext):
             )
 
         await session.start(agent=vta_agent, room=ctx.room, room_options=room_opts)
-
-        # Wire session into tool so it can kill the Realtime WS on end-call
-        log_tool._session = session
 
         # Update SIP identity after session links
         lp = getattr(getattr(session, "room_io", None), "linked_participant", None)
