@@ -92,8 +92,6 @@ DEFAULT_CALLBACK_NUMBER = os.getenv("DEFAULT_CALLBACK_NUMBER", "")
 
 CONFIG_DIR = Path(__file__).parent / "config"
 
-OPENING_LINE_TEMPLATE = "Hi, this call is for {full_name}."
-
 SYSTEM_CLOSING_OTHER = (
     "I apologize if this call caused any inconvenience. Thank you for your time — "
     "our representatives may try again later or contact you regarding the matter. Goodbye."
@@ -379,15 +377,8 @@ class VTAAgent(Agent):
         self._full_name = full_name
 
     async def on_enter(self):
-        opening = OPENING_LINE_TEMPLATE.format(full_name=self._full_name)
         await self.session.generate_reply(
-            instructions=(
-                "Speak the following opening line EXACTLY as written, "
-                "word-for-word, in a warm professional tone, then stop and "
-                "wait silently for the caller's reply. Do not add a preamble, "
-                "do not greet in any other way, do not ask anything else.\n\n"
-                f"OPENING LINE:\n{opening}"
-            ),
+            instructions=f"Hi, this call is for {self._full_name}.",
             allow_interruptions=False,
         )
 
