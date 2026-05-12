@@ -39,6 +39,7 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     RunContext,
+    TurnHandlingOptions,
     AudioConfig,
     BackgroundAudioPlayer,
     BuiltinAudioClip,
@@ -80,6 +81,7 @@ SILENCE_PROMPT_TEXT = os.getenv("SILENCE_PROMPT_TEXT", "Are you still there?")
 
 MAX_CALL_DURATION = float(os.getenv("MAX_CALL_DURATION", "300"))
 TOOL_NUDGE_DELAY = float(os.getenv("TOOL_NUDGE_DELAY", "0.5"))
+FORCE_END_SPEECH_TIMEOUT = float(os.getenv("FORCE_END_SPEECH_TIMEOUT", "10.0"))
 
 # ---------------------------------------------------------------------------
 # Dynamic variable defaults (always used for company/address/callback;
@@ -97,6 +99,41 @@ SYSTEM_CLOSING_OTHER = (
     "our representatives may try again later or contact you regarding the matter. Goodbye."
 )
 
+SYSTEM_CLOSING_MESSAGES = {
+    "verified": (
+        "Thank you. So, we're calling regarding a personal business matter of yours. "
+        "Please hold for a moment while I transfer you to our representative who can assist you further."
+    ),
+    "customer_wants_human": (
+        "Of course. Please hold for a moment while I connect you to an agent to assist you further."
+    ),
+    "wrong_number": (
+        "I'm so sorry for the confusion. I'll go ahead and update our records so you won't get "
+        "any more calls from us. Goodbye."
+    ),
+    "third_party_end": "Thank you for your time. Have a nice day!",
+    "consumer_busy_end": "Thank you for your time. Have a great day!",
+    "dnc": (
+        "I'm so sorry to bother you. I'll go ahead and update our records right now so you don't "
+        "get any more calls from us. Goodbye."
+    ),
+    "other": SYSTEM_CLOSING_OTHER,
+}
+
+TERMINAL_SPEECH_MARKERS = (
+    "please hold for a moment while i transfer",
+    "please hold for a moment while i connect",
+    "you won't get any more calls",
+    "you don't get any more calls",
+    "have a nice day",
+    "have a great day",
+    "have a good day",
+    "goodbye",
+    "bye-bye",
+    "end the call here",
+    "take care",
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -104,6 +141,13 @@ SYSTEM_CLOSING_OTHER = (
 def normalize_phone(raw: str) -> str:
     digits = re.sub(r"\D", "", raw)
     return digits[-10:] if len(digits) >= 10 else digits
+
+
+def looks_like_terminal_agent_speech(text: str | None) -> bool:
+    if not text:
+        return False
+    normalized = re.sub(r"\s+", " ", text).strip().lower()
+    return any(marker in normalized for marker in TERMINAL_SPEECH_MARKERS)
 
 
 def get_est_time() -> str:
@@ -512,8 +556,13 @@ async def entrypoint(ctx: JobContext):
         # ------------------------------------------------------------------
         session = AgentSession(
             llm=rt_model,
-            min_endpointing_delay=MIN_ENDPOINTING_DELAY,
-            max_endpointing_delay=MAX_ENDPOINTING_DELAY,
+            turn_handling=TurnHandlingOptions(
+                endpointing={
+                    "mode": "fixed",
+                    "min_delay": MIN_ENDPOINTING_DELAY,
+                    "max_delay": MAX_ENDPOINTING_DELAY,
+                },
+            ),
             user_away_timeout=USER_AWAY_TIMEOUT,
         )
 
@@ -596,13 +645,28 @@ async def entrypoint(ctx: JobContext):
         # ------------------------------------------------------------------
         # Tool nudge + force-end fallback
         #
-        # After the agent finishes speaking and goes to "listening":
+        # After the agent finishes a terminal closing and goes to "listening":
         #   - 0.5s: nudge fires → tells model to call log_verification
         #   - 5.5s: if model STILL hasn't called the tool, force-end
         #           from code (non-cancellable by user speech)
         # ------------------------------------------------------------------
         _nudge_task: asyncio.Task | None = None
         _force_end_timer: asyncio.Task | None = None
+        nudge_state: dict[str, bool] = {"last_agent_terminal": False}
+
+        @session.on("conversation_item_added")
+        def on_conversation_item(ev) -> None:
+            try:
+                item = getattr(ev, "item", None)
+                if getattr(item, "role", None) != "assistant":
+                    return
+                text_content = getattr(item, "text_content", None)
+                text = text_content if isinstance(text_content, str) else ""
+                nudge_state["last_agent_terminal"] = looks_like_terminal_agent_speech(text)
+                if nudge_state["last_agent_terminal"]:
+                    logger.info("[NUDGE] terminal assistant speech detected")
+            except Exception:
+                pass
 
         @session.on("agent_state_changed")
         def on_agent_state(ev) -> None:
@@ -627,18 +691,31 @@ async def entrypoint(ctx: JobContext):
                             return
                         if time.monotonic() - call_started_at < 5.0:
                             return
+                        if not nudge_state["last_agent_terminal"]:
+                            return
                         logger.info("[NUDGE] prompting model to call log_verification")
                         try:
-                            await session.generate_reply(instructions=(
+                            handle = session.generate_reply(instructions=(
                                 "You just finished speaking. If that was a "
                                 "closing, goodbye, transfer, or farewell "
                                 "statement, you MUST call log_verification "
                                 "RIGHT NOW with the appropriate status and "
                                 "summary. Do NOT speak again — just call "
                                 "the function immediately."
-                            ))
-                        except Exception:
-                            pass
+                            ), tool_choice={
+                                "type": "function",
+                                "function": {"name": "log_verification"},
+                            })
+
+                            async def _watch_nudge_reply() -> None:
+                                try:
+                                    await asyncio.wait_for(handle.wait_for_playout(), timeout=5.0)
+                                except Exception:
+                                    pass
+
+                            asyncio.create_task(_watch_nudge_reply())
+                        except Exception as e:
+                            logger.warning("[NUDGE] generate_reply failed: %s", e)
 
                         # Arm force-end fallback (5s). This is NOT cancelled
                         # by user speech or agent state — it's a hard deadline.
@@ -698,6 +775,31 @@ async def entrypoint(ctx: JobContext):
         # ------------------------------------------------------------------
         # System-driven force_end_call
         # ------------------------------------------------------------------
+        async def _speak_force_end_closing(sess: AgentSession, status: str) -> None:
+            closing = SYSTEM_CLOSING_MESSAGES.get(status, SYSTEM_CLOSING_OTHER)
+            instructions = (
+                "Speak exactly and only this closing line to the caller. "
+                "Do not call any tools. Do not add extra words. Do not ask a question. "
+                f"Closing line: {closing!r}"
+            )
+            try:
+                handle = sess.generate_reply(
+                    instructions=instructions,
+                    tool_choice="none",
+                )
+                await asyncio.wait_for(
+                    handle.wait_for_playout(),
+                    timeout=FORCE_END_SPEECH_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[END_CALL] system closing speech timed out after %.1fs",
+                    FORCE_END_SPEECH_TIMEOUT,
+                )
+            except Exception as e:
+                logger.warning("[END_CALL] system closing speech failed: %s", e)
+                await asyncio.sleep(min(3.0, FORCE_END_SPEECH_TIMEOUT))
+
         async def _force_end_call(sess: AgentSession, status: str, summary: str) -> None:
             if log_tool._ending:
                 return
@@ -709,12 +811,7 @@ async def entrypoint(ctx: JobContext):
             except Exception:
                 pass
 
-            try:
-                handle = sess.say(SYSTEM_CLOSING_OTHER, allow_interruptions=False)
-                if handle is not None and hasattr(handle, "wait_for_playout"):
-                    await handle.wait_for_playout()
-            except Exception:
-                await asyncio.sleep(3.0)
+            await _speak_force_end_closing(sess, status)
 
             # Fire logging in background
             room_name = (ctx.room.name if ctx.room else "") or ""
