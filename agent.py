@@ -687,16 +687,61 @@ async def entrypoint(ctx: JobContext):
                 logger.exception(f"[SILENCE] handler: {e}")
 
         # ------------------------------------------------------------------
-        # Tool nudge + force-end fallback
+        # Tool nudge + post-speech force-end (DECOUPLED)
         #
-        # After the agent finishes a terminal closing and goes to "listening":
-        #   - 0.5s: nudge fires → tells model to call log_verification
-        #   - 5.5s: if model STILL hasn't called the tool, force-end
-        #           from code (non-cancellable by user speech)
+        # Architecture:
+        #   - NUDGE: marker-gated. After agent speech, if the text matches a
+        #     closing marker, send a strong "call log_verification" instruction
+        #     with tool_choice="required". 0.5s delay.
+        #   - POST-SPEECH FORCE-END: marker-INDEPENDENT. After agent speech,
+        #     ALWAYS arm a timer. Fires silently (no system closing speech)
+        #     if no activity happens within the window.
+        #       - If marker matched   → 5s  (model should've called tool)
+        #       - If marker mismatched → 12s (safety net for paraphrased closings)
+        #     Cancelled by: agent speaks, user speaks, or tool is called.
+        #
+        # Why decoupled: previous design gated the force-end behind the marker
+        # check inside the nudge function. If the model paraphrased its closing
+        # (e.g., "Please hold while I transfer you" without "for a moment"),
+        # the marker missed, the force-end never armed, and the call hung
+        # indefinitely waiting for the model to call the tool.
         # ------------------------------------------------------------------
+        TERMINAL_FORCE_END_DELAY = 5.0   # fast path — closing detected
+        STUCK_FORCE_END_DELAY = 12.0     # safety net — closing not detected
+
         _nudge_task: asyncio.Task | None = None
         _force_end_timer: asyncio.Task | None = None
         nudge_state: dict[str, bool] = {"last_agent_terminal": False}
+
+        def _cancel_force_end_timer() -> None:
+            nonlocal _force_end_timer
+            if _force_end_timer is not None and not _force_end_timer.done():
+                _force_end_timer.cancel()
+            _force_end_timer = None
+
+        def _arm_force_end_timer(delay: float, reason: str) -> None:
+            nonlocal _force_end_timer
+            _cancel_force_end_timer()
+
+            async def _runner() -> None:
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    return
+                if log_tool._ending:
+                    return
+                logger.info(
+                    f"[FORCE_END] {reason} — {delay}s elapsed, ending silently"
+                )
+                # speak=False: agent already said its closing line; do not
+                # follow up with another system closing.
+                await _force_end_call(
+                    session, "other",
+                    f"Post-speech force-end ({reason})",
+                    speak=False,
+                )
+
+            _force_end_timer = asyncio.create_task(_runner())
 
         @session.on("conversation_item_added")
         def on_conversation_item(ev) -> None:
@@ -712,99 +757,97 @@ async def entrypoint(ctx: JobContext):
             except Exception:
                 pass
 
+        async def _send_nudge() -> None:
+            """Marker-gated. Sends a strong 'call the tool' instruction with
+            tool_choice='required'. Only fires if a closing marker matched."""
+            try:
+                await asyncio.sleep(TOOL_NUDGE_DELAY)
+            except asyncio.CancelledError:
+                return
+            if log_tool._ending:
+                return
+            if getattr(session, "user_state", "listening") == "speaking":
+                return
+            if time.monotonic() - call_started_at < 5.0:
+                return
+            if not nudge_state["last_agent_terminal"]:
+                return
+            logger.info("[NUDGE] prompting model to call log_verification")
+            try:
+                # tool_choice MUST be a string for xAI Realtime
+                # (per_response_tool_choice=False). "required" forces a tool
+                # call; since log_verification is our only tool, that's it.
+                handle = session.generate_reply(
+                    instructions=(
+                        "You just finished speaking. If that was a "
+                        "closing, goodbye, transfer, or farewell "
+                        "statement, you MUST call log_verification "
+                        "RIGHT NOW with the appropriate status and "
+                        "summary. Do NOT speak again — just call "
+                        "the function immediately."
+                    ),
+                    tool_choice="required",
+                )
+
+                async def _watch() -> None:
+                    try:
+                        await asyncio.wait_for(handle.wait_for_playout(), timeout=5.0)
+                    except Exception:
+                        pass
+
+                asyncio.create_task(_watch())
+            except Exception as e:
+                logger.warning("[NUDGE] generate_reply failed: %s", e)
+
         @session.on("agent_state_changed")
         def on_agent_state(ev) -> None:
-            nonlocal _nudge_task, _force_end_timer
+            nonlocal _nudge_task
             try:
                 if log_tool._ending:
                     return
                 ns = getattr(ev, "new_state", None)
                 if ns == "listening":
+                    # Agent finished speaking. Two things in parallel:
+                    #   1. Nudge (marker-gated) — fast path
+                    #   2. Force-end timer (always armed) — safety net
                     if _nudge_task is not None and not _nudge_task.done():
                         _nudge_task.cancel()
+                    _nudge_task = asyncio.create_task(_send_nudge())
 
-                    async def _nudge() -> None:
-                        nonlocal _force_end_timer
-                        try:
-                            await asyncio.sleep(TOOL_NUDGE_DELAY)
-                        except asyncio.CancelledError:
-                            return
-                        if log_tool._ending:
-                            return
-                        if getattr(session, "user_state", "listening") == "speaking":
-                            return
-                        if time.monotonic() - call_started_at < 5.0:
-                            return
-                        if not nudge_state["last_agent_terminal"]:
-                            return
-                        logger.info("[NUDGE] prompting model to call log_verification")
-                        try:
-                            # tool_choice="required" forces the model to call
-                            # a tool. Since log_verification is our only tool,
-                            # that's what gets called.
-                            # xAI Realtime requires tool_choice as a STRING
-                            # (per_response_tool_choice=False) — passing a
-                            # dict here breaks the WebSocket session.
-                            handle = session.generate_reply(
-                                instructions=(
-                                    "You just finished speaking. If that was a "
-                                    "closing, goodbye, transfer, or farewell "
-                                    "statement, you MUST call log_verification "
-                                    "RIGHT NOW with the appropriate status and "
-                                    "summary. Do NOT speak again — just call "
-                                    "the function immediately."
-                                ),
-                                tool_choice="required",
-                            )
+                    # Skip the very first listening transition (initial opening line)
+                    if time.monotonic() - call_started_at < 5.0:
+                        return
 
-                            async def _watch_nudge_reply() -> None:
-                                try:
-                                    await asyncio.wait_for(handle.wait_for_playout(), timeout=5.0)
-                                except Exception:
-                                    pass
+                    if nudge_state["last_agent_terminal"]:
+                        _arm_force_end_timer(
+                            TERMINAL_FORCE_END_DELAY,
+                            "terminal-speech-detected",
+                        )
+                    else:
+                        _arm_force_end_timer(
+                            STUCK_FORCE_END_DELAY,
+                            "post-speech-stuck",
+                        )
 
-                            asyncio.create_task(_watch_nudge_reply())
-                        except Exception as e:
-                            logger.warning("[NUDGE] generate_reply failed: %s", e)
-
-                        # Arm force-end fallback (5s). This is NOT cancelled
-                        # by user speech or agent state — it's a hard deadline.
-                        if _force_end_timer is None or _force_end_timer.done():
-                            async def _force_end_after_nudge() -> None:
-                                try:
-                                    await asyncio.sleep(5.0)
-                                except asyncio.CancelledError:
-                                    return
-                                if not log_tool._ending:
-                                    logger.info("[NUDGE] force-ending — model ignored nudge")
-                                    await _force_end_call(
-                                        session, "other",
-                                        "Model did not call log_verification after nudge",
-                                    )
-
-                            _force_end_timer = asyncio.create_task(
-                                _force_end_after_nudge()
-                            )
-
-                    _nudge_task = asyncio.create_task(_nudge())
                 elif ns in ("speaking", "thinking"):
+                    # Agent is actively producing output → conversation alive.
+                    # Cancel both nudge and force-end.
                     if _nudge_task is not None and not _nudge_task.done():
                         _nudge_task.cancel()
                         _nudge_task = None
-                    # NOTE: _force_end_timer is intentionally NOT cancelled
-                    # when agent speaks — it's a hard deadline.
+                    _cancel_force_end_timer()
             except Exception:
                 pass
 
         @session.on("user_state_changed")
-        def on_user_nudge_cancel(ev) -> None:
+        def on_user_speech_cancel(ev) -> None:
+            """User speaking = conversation alive. Cancel both nudge and timer."""
             nonlocal _nudge_task
             if getattr(ev, "new_state", None) == "speaking":
                 if _nudge_task is not None and not _nudge_task.done():
                     _nudge_task.cancel()
                     _nudge_task = None
-                # NOTE: _force_end_timer is intentionally NOT cancelled
-                # when user speaks — it's a hard deadline.
+                _cancel_force_end_timer()
 
         # ------------------------------------------------------------------
         # Max duration watchdog
@@ -850,18 +893,27 @@ async def entrypoint(ctx: JobContext):
                 logger.warning("[END_CALL] system closing speech failed: %s", e)
                 await asyncio.sleep(min(3.0, FORCE_END_SPEECH_TIMEOUT))
 
-        async def _force_end_call(sess: AgentSession, status: str, summary: str) -> None:
+        async def _force_end_call(
+            sess: AgentSession, status: str, summary: str, *, speak: bool = True,
+        ) -> None:
+            """Force-end the call from code.
+
+            speak=True  → speaks a system closing line first (silence/watchdog).
+            speak=False → just disconnects (used when the agent already said a
+                          closing — no need to follow up with another goodbye).
+            """
             if log_tool._ending:
                 return
             log_tool._ending = True
-            logger.info(f"[END_CALL] system: status={status}")
+            logger.info(f"[END_CALL] system: status={status} speak={speak}")
 
             try:
                 sess.interrupt()
             except Exception:
                 pass
 
-            await _speak_force_end_closing(sess, status)
+            if speak:
+                await _speak_force_end_closing(sess, status)
 
             # Fire logging in background
             room_name = (ctx.room.name if ctx.room else "") or ""
