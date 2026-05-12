@@ -374,16 +374,27 @@ class LogVerificationTool(Toolset):
         #    because the session is waiting for THIS tool to return.
         job_ctx = get_job_context()
         room_name = (job_ctx.room.name if job_ctx.room else "") or ""
+
+        # Resolve SIP identity fresh — if it wasn't captured at session start
+        # (e.g., SIP joined silently after the 3s discovery window), look it
+        # up now from the current room state.
+        sip_id = self._sip_identity
+        if not sip_id and job_ctx.room:
+            sip_p = find_primary_sip_participant(job_ctx.room)
+            if sip_p is not None:
+                sip_id = sip_p.identity or ""
+                logger.info(f"[END_CALL] resolved SIP identity at end-time: {sip_id}")
+
         removed = False
-        if room_name and self._sip_identity:
+        if room_name and sip_id:
             try:
                 await job_ctx.api.room.remove_participant(
                     api.RoomParticipantIdentity(
-                        room=room_name, identity=self._sip_identity,
+                        room=room_name, identity=sip_id,
                     )
                 )
                 removed = True
-                logger.info(f"[END_CALL] SIP {self._sip_identity} removed — BYE sent to TCN")
+                logger.info(f"[END_CALL] SIP {sip_id} removed — BYE sent to TCN")
             except Exception as e:
                 logger.warning(f"[END_CALL] remove_participant failed: {e}")
 
@@ -586,6 +597,39 @@ async def entrypoint(ctx: JobContext):
                 log_tool._phone = phone
 
         # ------------------------------------------------------------------
+        # Continuous SIP identity tracker — if SIP joins AFTER the 3s
+        # discovery window (or session.start), capture its identity so we
+        # can remove it cleanly on end-call.
+        # ------------------------------------------------------------------
+        @ctx.room.on("participant_connected")
+        def _on_late_participant(p: rtc.RemoteParticipant):
+            nonlocal sip_identity, phone
+            if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+                if not sip_identity:
+                    sip_identity = p.identity or ""
+                    log_tool._sip_identity = sip_identity
+                    logger.info(f"[SIP] late-joined participant captured: {sip_identity}")
+                if not phone:
+                    extracted = extract_phone_from_participant(p)
+                    if extracted:
+                        phone = extracted
+                        log_tool._phone = phone
+
+        # If SIP already joined silently before we attached this listener,
+        # do one final sweep now.
+        if not sip_identity:
+            sip_p = find_primary_sip_participant(ctx.room)
+            if sip_p is not None:
+                sip_identity = sip_p.identity or ""
+                log_tool._sip_identity = sip_identity
+                logger.info(f"[SIP] post-start sweep captured: {sip_identity}")
+                if not phone:
+                    extracted = extract_phone_from_participant(sip_p)
+                    if extracted:
+                        phone = extracted
+                        log_tool._phone = phone
+
+        # ------------------------------------------------------------------
         # Background audio
         # ------------------------------------------------------------------
         background_audio = None
@@ -695,17 +739,23 @@ async def entrypoint(ctx: JobContext):
                             return
                         logger.info("[NUDGE] prompting model to call log_verification")
                         try:
-                            handle = session.generate_reply(instructions=(
-                                "You just finished speaking. If that was a "
-                                "closing, goodbye, transfer, or farewell "
-                                "statement, you MUST call log_verification "
-                                "RIGHT NOW with the appropriate status and "
-                                "summary. Do NOT speak again — just call "
-                                "the function immediately."
-                            ), tool_choice={
-                                "type": "function",
-                                "function": {"name": "log_verification"},
-                            })
+                            # tool_choice="required" forces the model to call
+                            # a tool. Since log_verification is our only tool,
+                            # that's what gets called.
+                            # xAI Realtime requires tool_choice as a STRING
+                            # (per_response_tool_choice=False) — passing a
+                            # dict here breaks the WebSocket session.
+                            handle = session.generate_reply(
+                                instructions=(
+                                    "You just finished speaking. If that was a "
+                                    "closing, goodbye, transfer, or farewell "
+                                    "statement, you MUST call log_verification "
+                                    "RIGHT NOW with the appropriate status and "
+                                    "summary. Do NOT speak again — just call "
+                                    "the function immediately."
+                                ),
+                                tool_choice="required",
+                            )
 
                             async def _watch_nudge_reply() -> None:
                                 try:
@@ -820,22 +870,31 @@ async def entrypoint(ctx: JobContext):
                 call_started_at, room_name, http_session,
             ))
 
-            # Remove SIP
-            if room_name and sip_identity:
+            # Resolve SIP identity fresh (may have joined after our 3s window)
+            sip_id = sip_identity
+            if not sip_id and ctx.room:
+                sip_p = find_primary_sip_participant(ctx.room)
+                if sip_p is not None:
+                    sip_id = sip_p.identity or ""
+                    logger.info(f"[END_CALL] resolved SIP at force-end: {sip_id}")
+
+            removed = False
+            if room_name and sip_id:
                 try:
                     await ctx.api.room.remove_participant(
-                        api.RoomParticipantIdentity(room=room_name, identity=sip_identity)
+                        api.RoomParticipantIdentity(room=room_name, identity=sip_id)
                     )
-                except Exception:
-                    try:
-                        await ctx.delete_room()
-                    except Exception:
-                        pass
-            elif room_name:
+                    removed = True
+                    logger.info(f"[END_CALL] force-end removed SIP {sip_id}")
+                except Exception as e:
+                    logger.warning(f"[END_CALL] force-end remove_participant failed: {e}")
+
+            if not removed and room_name:
                 try:
                     await ctx.delete_room()
-                except Exception:
-                    pass
+                    logger.info(f"[END_CALL] force-end deleted room {room_name}")
+                except Exception as e:
+                    logger.error(f"[END_CALL] force-end delete_room failed: {e}")
 
             try:
                 ctx.shutdown(reason=f"agent_end_call:{status}")
