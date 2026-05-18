@@ -6,18 +6,20 @@ Architecture (TCN 3-way call):
   - TCN leg B: TCN <-> LiveKit SIP gateway (SIP participant in this room)
   - LiveKit room: { SIP participant, VTA agent }
 
-End-of-call flow (deterministic, no callbacks):
+End-of-call flow (deterministic):
   1. LLM speaks the closing line (per prompt's CLOSING PROTOCOL)
-  2. LLM calls log_verification tool
+  2. LLM calls log_verification tool — same turn
   3. Tool: disallow_interruptions
-  4. Tool: asyncio.sleep(1.5) — fixed delay for closing audio to stream
-  5. Tool: remove SIP participant → BYE to TCN (ACTUAL call end)
-  6. Tool: fire Railway HTTP logging in background (non-blocking)
-  7. Tool: job_ctx.shutdown() → worker cleanup
-  8. Tool: return "" (SIP is already gone — model can't speak to anyone)
-
-  NOTE: Do NOT call session.aclose() from inside this tool — it
-  deadlocks because the session is waiting for the tool to return.
+  4. Tool: register ctx.speech_handle.add_done_callback → shutdown agent
+     when closing AUDIO finishes (Riley pattern — no fixed sleep,
+     no audio cut-off)
+  5. Tool: fire Railway HTTP log in parallel (POST returns 200)
+  6. Tool: return ""
+  7. When closing audio playback completes → callback fires →
+     job_ctx.shutdown() → AGENT disconnects from room
+  8. SIP participant STAYS in the room (TCN owns it). TCN uses
+     Railway's 200 response to decide what to do with leg A
+     (transfer to human, hang up, etc.). We never send BYE.
 """
 
 import asyncio
@@ -121,17 +123,46 @@ SYSTEM_CLOSING_MESSAGES = {
 }
 
 TERMINAL_SPEECH_MARKERS = (
-    "please hold for a moment while i transfer",
-    "please hold for a moment while i connect",
-    "you won't get any more calls",
-    "you don't get any more calls",
+    # Transfer / connect markers (verified, customer_wants_human)
+    "while i transfer",
+    "while i'll transfer",
+    "while i connect",
+    "transfer you to",
+    "transferring you",
+    "connect you to",
+    "connect you with",
+    "connecting you",
+    # End-of-call goodbyes
     "have a nice day",
     "have a great day",
     "have a good day",
+    "have a wonderful day",
+    "have a good evening",
+    "have a good one",
     "goodbye",
     "bye-bye",
-    "end the call here",
+    "bye bye",
     "take care",
+    # Record-update / wrong-number / DNC markers
+    "won't get any more calls",
+    "don't get any more calls",
+    "won't bother you",
+    "remove your number",
+    "remove you from",
+    "update our records",
+    # Refusal / hostile
+    "end the call here",
+    "end the call now",
+    "thank you for your time",
+    "appreciate your time",
+    "appreciate your help",
+    "appreciate it",
+    # Bereavement / medical
+    "sorry to bother",
+    "sorry for bothering",
+    "sorry for the inconvenience",
+    "handle this on our end",
+    "make a note",
 )
 
 
@@ -326,7 +357,11 @@ _LOG_VERIFICATION_SCHEMA: dict[str, Any] = {
 
 
 class LogVerificationTool(Toolset):
-    """Logs disposition to Railway, waits for closing audio, removes SIP, shuts down."""
+    """Logs disposition to Railway, then disconnects the agent when the
+    closing-phrase audio finishes playing. SIP participant is left in
+    the room — TCN owns its leg and tears it down based on Railway's
+    disposition response.
+    """
 
     def __init__(
         self, *, phone: str, full_name: str, call_started_at: float,
@@ -337,7 +372,7 @@ class LogVerificationTool(Toolset):
         self._phone = phone
         self._full_name = full_name
         self._call_started_at = call_started_at
-        self._sip_identity = sip_identity
+        self._sip_identity = sip_identity  # kept for legacy callers; not used to remove SIP
         self._http = http
         self._ending = False
 
@@ -360,67 +395,56 @@ class LogVerificationTool(Toolset):
         except Exception:
             pass
 
-        # 2. Fixed delay — let the closing-line audio play out.
-        #    ctx.wait_for_playout() HANGS with xAI Realtime (generation
-        #    future never resolves). 1.5s lets most of the closing phrase
-        #    stream before we cut the SIP leg.
-        await asyncio.sleep(1.5)
-        logger.info("[END_CALL] 1.5s playout delay done")
-
-        # 3. REMOVE SIP PARTICIPANT IMMEDIATELY — this is the BYE to TCN.
-        #    This is THE action that actually ends the call. Everything
-        #    after this is just housekeeping.
-        #    NOTE: Do NOT call session.aclose() before this — it deadlocks
-        #    because the session is waiting for THIS tool to return.
+        # 2. Register: when the closing-phrase AUDIO finishes playing,
+        #    disconnect the AGENT only. SIP participant is left in the
+        #    room — TCN owns its leg and will handle it based on the
+        #    Railway disposition response (200 → transfer, 204 → hangup).
+        #
+        #    speech_handle.add_done_callback fires when the model's turn
+        #    is complete, which means the closing audio has finished
+        #    streaming. No fixed sleep — the audio is never cut off, and
+        #    we disconnect IMMEDIATELY after it completes.
         job_ctx = get_job_context()
         room_name = (job_ctx.room.name if job_ctx.room else "") or ""
+        ending_status = status
 
-        # Resolve SIP identity fresh — if it wasn't captured at session start
-        # (e.g., SIP joined silently after the 3s discovery window), look it
-        # up now from the current room state.
-        sip_id = self._sip_identity
-        if not sip_id and job_ctx.room:
-            sip_p = find_primary_sip_participant(job_ctx.room)
-            if sip_p is not None:
-                sip_id = sip_p.identity or ""
-                logger.info(f"[END_CALL] resolved SIP identity at end-time: {sip_id}")
-
-        removed = False
-        if room_name and sip_id:
+        def _on_speech_done(_handle) -> None:
+            logger.info(f"[END_CALL] closing audio done — disconnecting agent (status={ending_status})")
             try:
-                await job_ctx.api.room.remove_participant(
-                    api.RoomParticipantIdentity(
-                        room=room_name, identity=sip_id,
-                    )
-                )
-                removed = True
-                logger.info(f"[END_CALL] SIP {sip_id} removed — BYE sent to TCN")
+                job_ctx.shutdown(reason=f"agent_end_call:{ending_status}")
             except Exception as e:
-                logger.warning(f"[END_CALL] remove_participant failed: {e}")
+                logger.warning(f"[END_CALL] shutdown failed: {e}")
 
-        if not removed and room_name:
-            try:
-                await job_ctx.delete_room()
-                logger.info(f"[END_CALL] room {room_name} deleted (fallback)")
-            except Exception as e:
-                logger.error(f"[END_CALL] delete_room failed: {e}")
+        try:
+            ctx.speech_handle.add_done_callback(_on_speech_done)
+            logger.info("[END_CALL] registered speech_handle done callback")
+        except Exception as e:
+            # Fallback if speech_handle isn't available — disconnect after
+            # a short delay to let audio drain.
+            logger.warning(f"[END_CALL] speech_handle callback failed: {e}; using fallback")
+            async def _fallback_shutdown() -> None:
+                await asyncio.sleep(2.0)
+                try:
+                    job_ctx.shutdown(reason=f"agent_end_call:{ending_status}")
+                except Exception:
+                    pass
+            asyncio.create_task(_fallback_shutdown())
 
-        # 4. Fire Railway logging in background — non-blocking.
+        # 3. POST disposition to Railway in parallel with the audio.
+        #    By the time the closing audio finishes (~2-3s), Railway has
+        #    responded with 200 (transfer) or 204 (hangup), and TCN has
+        #    received the disposition signal. Then the audio-done callback
+        #    fires and the agent disconnects.
         asyncio.create_task(_fire_railway_log(
             self._phone, status, summary, full_name,
             self._call_started_at, room_name, self._http,
         ))
 
-        # 5. Shut down the job. This cleans up the session, Realtime WS,
-        #    and worker resources. Even if the model generates follow-up
-        #    speech, the SIP participant is already gone — no one hears it.
-        try:
-            job_ctx.shutdown(reason=f"agent_end_call:{status}")
-        except Exception:
-            pass
-
-        # 6. Return empty string.
+        # 4. Return immediately. The audio is still streaming, the model's
+        #    turn isn't complete yet, and the disconnect happens via the
+        #    speech_handle done callback above.
         return ""
+
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +925,10 @@ async def entrypoint(ctx: JobContext):
             speak=True  → speaks a system closing line first (silence/watchdog).
             speak=False → just disconnects (used when the agent already said a
                           closing — no need to follow up with another goodbye).
+
+            We DO NOT remove the SIP participant. TCN owns its leg and will
+            tear it down based on the Railway disposition response (200 for
+            transfers, 204 for hangups). Only the AGENT disconnects.
             """
             if log_tool._ending:
                 return
@@ -915,39 +943,16 @@ async def entrypoint(ctx: JobContext):
             if speak:
                 await _speak_force_end_closing(sess, status)
 
-            # Fire logging in background
+            # Fire Railway logging in background — POST gets 200/204 from
+            # Railway, which forwards the disposition to TCN.
             room_name = (ctx.room.name if ctx.room else "") or ""
             asyncio.create_task(_fire_railway_log(
                 phone, status, summary, full_name,
                 call_started_at, room_name, http_session,
             ))
 
-            # Resolve SIP identity fresh (may have joined after our 3s window)
-            sip_id = sip_identity
-            if not sip_id and ctx.room:
-                sip_p = find_primary_sip_participant(ctx.room)
-                if sip_p is not None:
-                    sip_id = sip_p.identity or ""
-                    logger.info(f"[END_CALL] resolved SIP at force-end: {sip_id}")
-
-            removed = False
-            if room_name and sip_id:
-                try:
-                    await ctx.api.room.remove_participant(
-                        api.RoomParticipantIdentity(room=room_name, identity=sip_id)
-                    )
-                    removed = True
-                    logger.info(f"[END_CALL] force-end removed SIP {sip_id}")
-                except Exception as e:
-                    logger.warning(f"[END_CALL] force-end remove_participant failed: {e}")
-
-            if not removed and room_name:
-                try:
-                    await ctx.delete_room()
-                    logger.info(f"[END_CALL] force-end deleted room {room_name}")
-                except Exception as e:
-                    logger.error(f"[END_CALL] force-end delete_room failed: {e}")
-
+            # Disconnect AGENT only. SIP participant stays — TCN handles
+            # leg B teardown after it acts on the Railway disposition.
             try:
                 ctx.shutdown(reason=f"agent_end_call:{status}")
             except Exception:
