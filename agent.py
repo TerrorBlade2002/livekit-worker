@@ -711,27 +711,23 @@ async def entrypoint(ctx: JobContext):
                 logger.exception(f"[SILENCE] handler: {e}")
 
         # ------------------------------------------------------------------
-        # Tool nudge + post-speech force-end (DECOUPLED)
+        # Tool nudge + post-speech force-end
         #
         # Architecture:
         #   - NUDGE: marker-gated. After agent speech, if the text matches a
         #     closing marker, send a strong "call log_verification" instruction
         #     with tool_choice="required". 0.5s delay.
-        #   - POST-SPEECH FORCE-END: marker-INDEPENDENT. After agent speech,
-        #     ALWAYS arm a timer. Fires silently (no system closing speech)
-        #     if no activity happens within the window.
-        #       - If marker matched   → 5s  (model should've called tool)
-        #       - If marker mismatched → 12s (safety net for paraphrased closings)
-        #     Cancelled by: agent speaks, user speaks, or tool is called.
+        #   - FORCE-END TIMER: marker-gated. Armed ONLY when a closing marker
+        #     matched. Fires silently after 5s if the tool wasn't called.
         #
-        # Why decoupled: previous design gated the force-end behind the marker
-        # check inside the nudge function. If the model paraphrased its closing
-        # (e.g., "Please hold while I transfer you" without "for a moment"),
-        # the marker missed, the force-end never armed, and the call hung
-        # indefinitely waiting for the model to call the tool.
+        # Why marker-gated: arming an unconditional "stuck" timer breaks
+        # normal conversation — when the customer takes 12s+ to respond to a
+        # mid-call question, we would incorrectly force-end the call. For
+        # missed-marker closings, the existing user_away → silence handler
+        # (10s "Are you still there?" → 50s silence force-end) is the
+        # safety net. Slower but safe.
         # ------------------------------------------------------------------
         TERMINAL_FORCE_END_DELAY = 5.0   # fast path — closing detected
-        STUCK_FORCE_END_DELAY = 12.0     # safety net — closing not detected
 
         _nudge_task: asyncio.Task | None = None
         _force_end_timer: asyncio.Task | None = None
@@ -831,9 +827,17 @@ async def entrypoint(ctx: JobContext):
                     return
                 ns = getattr(ev, "new_state", None)
                 if ns == "listening":
-                    # Agent finished speaking. Two things in parallel:
-                    #   1. Nudge (marker-gated) — fast path
-                    #   2. Force-end timer (always armed) — safety net
+                    # Agent finished speaking.
+                    #   1. Always send a marker-gated nudge (fast path)
+                    #   2. ONLY arm the force-end timer if a closing marker
+                    #      matched. Do NOT arm a "stuck" timer for non-marker
+                    #      speech — that breaks normal conversation when the
+                    #      user takes more than ~12s to respond.
+                    #
+                    #   For missed closings (model paraphrased and our markers
+                    #   don't catch it), the existing user_away → silence
+                    #   handler is the safety net (10s "Are you still there?"
+                    #   then 50s silence force-end). Slower but safe.
                     if _nudge_task is not None and not _nudge_task.done():
                         _nudge_task.cancel()
                     _nudge_task = asyncio.create_task(_send_nudge())
@@ -847,11 +851,7 @@ async def entrypoint(ctx: JobContext):
                             TERMINAL_FORCE_END_DELAY,
                             "terminal-speech-detected",
                         )
-                    else:
-                        _arm_force_end_timer(
-                            STUCK_FORCE_END_DELAY,
-                            "post-speech-stuck",
-                        )
+                    # else: NO force-end armed. Rely on user_away path.
 
                 elif ns in ("speaking", "thinking"):
                     # Agent is actively producing output → conversation alive.
