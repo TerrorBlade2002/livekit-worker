@@ -167,6 +167,17 @@ uv run python agent.py dev
 | `[METRICS:...]`    | Per-turn pipeline metrics (STT/LLM/TTS/EOU ttft+duration)  |
 | `[END_CALL]`       | Final hangup result + total time + SIP identity removed    |
 | `[END_CALL_TIMING]`| Per-step timing inside `log_verification`                  |
+| `[METRICS]`        | Prometheus exposition mode (scrape port / remote-write)    |
+
+### Prometheus + Grafana metrics
+
+Beyond logs, the agent exports Prometheus metrics (latency, tokens, call
+dispositions, reliability) via [`observability.py`](observability.py). Because
+the managed Cloud agent has no scrapeable port and scales to zero, it pushes to
+Grafana Cloud (`METRICS_MODE=remote_write`); locally it exposes `/metrics`
+(`METRICS_MODE=scrape`). Full setup, dashboard, and alerts:
+[`../monitoring/README.md`](../monitoring/README.md). Configure via the
+`METRICS_*` vars in [.env.example](.env.example).
 
 ## Important
 The existing webhook repo should continue to own only the Node webhook server in [retell-vta-webhook/retell-vta-webhook](../retell-vta-webhook/retell-vta-webhook).

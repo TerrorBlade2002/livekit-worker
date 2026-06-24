@@ -62,6 +62,10 @@ load_dotenv(dotenv_path=_ENV_PATH, override=True)
 logger = logging.getLogger("vta-agent")
 logger.setLevel(logging.INFO)
 
+# Prometheus observability. Imported AFTER load_dotenv() above so the module
+# reads METRICS_* env vars at import time.
+import observability  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -380,6 +384,7 @@ class LogVerificationTool(Toolset):
         self, raw_arguments: dict[str, object], ctx: RunContext,
     ) -> str:
         if self._ending:
+            observability.record_tool_call("log_verification", "duplicate")
             return ""
         self._ending = True
 
@@ -388,6 +393,11 @@ class LogVerificationTool(Toolset):
         full_name = str(raw_arguments.get("full_name", self._full_name))
 
         logger.info(f"[END_CALL] status={status} phone={self._phone} summary={summary!r}")
+        observability.record_tool_call("log_verification", "ok")
+        try:
+            observability.note_status(ctx.session, status)
+        except Exception:
+            pass
 
         # 1. Lock out user interruptions so closing audio plays cleanly.
         try:
@@ -466,6 +476,10 @@ class VTAAgent(Agent):
 # Entrypoint
 # ---------------------------------------------------------------------------
 server = AgentServer()
+
+# Start metrics exposition once at process boot (scrape server and/or
+# Grafana Cloud remote-write, per METRICS_MODE). Idempotent + non-fatal.
+observability.init_exposition()
 
 
 @server.rtc_session(agent_name=os.getenv("AGENT_NAME", "vta-emma"))
@@ -610,6 +624,12 @@ async def entrypoint(ctx: JobContext):
 
         await session.start(agent=vta_agent, room=ctx.room, room_options=room_opts)
 
+        # Attach Prometheus instrumentation to this call (latency, tokens,
+        # disposition, active-session gauge, shutdown finalizer).
+        observability.instrument_session(
+            session, ctx, model=(GROK_REALTIME_MODEL or "grok-realtime")
+        )
+
         # Update SIP identity after session links
         lp = getattr(getattr(session, "room_io", None), "linked_participant", None)
         if lp is not None and lp.identity:
@@ -681,6 +701,7 @@ async def entrypoint(ctx: JobContext):
             if getattr(session, "user_state", "listening") != "away":
                 return
             logger.info(f"[SILENCE] {SILENCE_TOTAL_SECONDS}s — force ending")
+            observability.record_forced_end("silence")
             await _force_end_call(session, "other",
                 f"Caller silent for {int(SILENCE_TOTAL_SECONDS)}s")
 
@@ -753,6 +774,7 @@ async def entrypoint(ctx: JobContext):
                 logger.info(
                     f"[FORCE_END] {reason} — {delay}s elapsed, ending silently"
                 )
+                observability.record_forced_end("terminal_speech")
                 # speak=False: agent already said its closing line; do not
                 # follow up with another system closing.
                 await _force_end_call(
@@ -884,6 +906,7 @@ async def entrypoint(ctx: JobContext):
             if log_tool._ending:
                 return
             logger.info(f"[WATCHDOG] max duration {MAX_CALL_DURATION}s — force ending")
+            observability.record_forced_end("max_duration")
             await _force_end_call(session, "other",
                 f"Max duration {int(MAX_CALL_DURATION)}s reached")
 
@@ -933,6 +956,7 @@ async def entrypoint(ctx: JobContext):
             if log_tool._ending:
                 return
             log_tool._ending = True
+            observability.note_status(sess, status)
             logger.info(f"[END_CALL] system: status={status} speak={speak}")
 
             try:
@@ -990,6 +1014,7 @@ async def entrypoint(ctx: JobContext):
         )
 
     except Exception:
+        observability.record_error("entrypoint")
         try:
             await http_session.close()
         except Exception:

@@ -12,3 +12,11 @@ livekit-api>=1.0
 
 python-dotenv>=1.0.0
 aiohttp>=3.9.0
+
+# --- Observability (Prometheus + Grafana) ---
+# prometheus-client: metric types + the /metrics scrape endpoint.
+prometheus-client>=0.20
+# prometheus-remote-writer: pure-Python (no snappy/C deps) Prometheus
+# remote-write client. Used only when METRICS_MODE includes "remote_write"
+# to push metrics from the managed (scale-to-zero) Cloud agent to Grafana Cloud.
+prometheus-remote-writer>=1.1
