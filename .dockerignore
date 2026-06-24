@@ -1,0 +1,15 @@
+# Keep secrets and local-only cruft out of the LiveKit Cloud build image.
+# IMPORTANT: agent.py does load_dotenv(override=True) — if .env were baked in,
+# it would override the Cloud-injected LIVEKIT_* and the agent secrets. All
+# runtime config is provided via `lk agent` secrets instead.
+.env
+.env.example
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.pytest_cache/
+.mypy_cache/
