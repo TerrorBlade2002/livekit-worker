@@ -267,11 +267,37 @@ def load_prompt(filename: str) -> str:
     return (CONFIG_DIR / filename).read_text(encoding="utf-8")
 
 
-def render_prompt(template: str, variables: dict[str, str]) -> str:
-    result = template
-    for key, value in variables.items():
-        result = result.replace("{" + key + "}", value)
-    return result
+# Per-call dynamic variables, in a stable order. Everything that varies from
+# call to call lives ONLY in the appended CALL CONTEXT suffix (below) — never in
+# the static prompt body — so the OpenAI backend can prompt-cache the large
+# byte-identical prefix (the whole of system_prompt.md) across calls.
+CALL_CONTEXT_KEYS = (
+    "full_name", "company_name", "company_address", "call_back_number", "current_time",
+)
+
+
+def build_call_context(variables: dict[str, str]) -> str:
+    """Render the compact, per-call suffix appended AFTER the static prompt body.
+
+    The static body keeps every reference as a literal ``{token}`` placeholder, so
+    it never changes between calls. This block maps those tokens to this call's
+    real values. Because the values live in the suffix, the whole prompt prefix
+    stays byte-identical across calls and remains warm in the provider prompt
+    cache — verify the rising hit rate via the
+    ``livekit_llm_prompt_cached_tokens_total`` Prometheus metric.
+    """
+    lines = [
+        "",
+        "---",
+        "",
+        "## CALL CONTEXT",
+        "Real values for the placeholder tokens used throughout the instructions "
+        "above, for THIS call only. Wherever a token appears, speak the value shown "
+        'here — never the token, its braces, or the word "placeholder."',
+    ]
+    for key in CALL_CONTEXT_KEYS:
+        lines.append(f"- `{{{key}}}` = {variables.get(key, '')}")
+    return "\n" + "\n".join(lines) + "\n"
 
 
 def extract_phone_from_participant(p: rtc.RemoteParticipant) -> str:
@@ -463,7 +489,12 @@ class LogVerificationTool(Toolset):
 
         status = str(raw_arguments.get("status", "other"))
         summary = str(raw_arguments.get("summary", ""))
-        full_name = str(raw_arguments.get("full_name", self._full_name))
+        # Per-call values live as {tokens} in the prompt body now (see
+        # build_call_context); if the model echoes an unsubstituted token or
+        # omits the name, fall back to the authoritative name on file.
+        full_name = str(raw_arguments.get("full_name") or "").strip()
+        if not full_name or "{" in full_name:
+            full_name = self._full_name
 
         logger.info(f"[END_CALL] status={status} phone={self._phone} summary={summary!r}")
         observability.record_tool_call("log_verification", "ok")
@@ -795,8 +826,14 @@ async def entrypoint(ctx: JobContext):
 
         # ------------------------------------------------------------------
         # Build agent
+        #
+        # The static system_prompt.md body is sent verbatim (byte-identical
+        # across every call) so the OpenAI backend prompt-caches the whole
+        # prefix; only the appended CALL CONTEXT suffix carries this call's
+        # dynamic values. See build_call_context() and the
+        # livekit_llm_prompt_cached_tokens_total metric.
         # ------------------------------------------------------------------
-        instructions = render_prompt(load_prompt("system_prompt.md"), prompt_vars)
+        instructions = load_prompt("system_prompt.md") + build_call_context(prompt_vars)
 
         log_tool = LogVerificationTool(
             phone=phone, full_name=full_name,
