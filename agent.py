@@ -5,7 +5,7 @@ Pipeline (all stages streaming, every stage swappable via env):
   - VAD : Silero                (prewarmed once per worker process)
   - STT : Deepgram Flux         (model-integrated turn detection, eager EOT)
           AssemblyAI Universal Streaming as an A/B alternative
-  - LLM : OpenAI GPT-4.1 mini   (critical path — low latency, no reasoning step)
+  - LLM : OpenAI GPT-5.1 Chat   (critical path — gpt-5.1-chat-latest, no reasoning step)
   - TTS : Cartesia Sonic 3.5    (fast first-byte streaming)
   - Turn detection : Deepgram Flux EOT ("stt") by default; LiveKit TurnDetector
                      and VAD also available
