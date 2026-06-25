@@ -1,5 +1,21 @@
 """
-VTA Emma — LiveKit Voice Agent (xAI Grok Realtime, non-thinking)
+VTA Emma — LiveKit Voice Agent (cascaded STT → LLM → TTS pipeline)
+
+Pipeline (all stages streaming, every stage swappable via env):
+  - VAD : Silero                (prewarmed once per worker process)
+  - STT : Deepgram Flux         (model-integrated turn detection, eager EOT)
+          AssemblyAI Universal Streaming as an A/B alternative
+  - LLM : OpenAI GPT-4.1 mini   (critical path — low latency, no reasoning step)
+  - TTS : Cartesia Sonic 3.5    (fast first-byte streaming)
+  - Turn detection : Deepgram Flux EOT ("stt") by default; LiveKit TurnDetector
+                     and VAD also available
+  - Interruption   : LiveKit Adaptive Interruption Handling (barge-in model)
+  - Preemptive generation : LLM starts before end-of-turn is confirmed
+
+Access defaults to LiveKit Inference (co-located with the agent on LiveKit
+Cloud → lowest latency, single key, guaranteed aligned transcripts for adaptive
+interruption). Set STT_BACKEND / LLM_BACKEND / TTS_BACKEND = "plugin" to use the
+direct provider plugins with your own API keys instead.
 
 Architecture (TCN 3-way call):
   - TCN leg A: TCN <-> Customer (TCN owns this — never touched here)
@@ -40,6 +56,7 @@ from livekit.agents import (
     AgentServer,
     AgentSession,
     JobContext,
+    JobProcess,
     RunContext,
     TurnHandlingOptions,
     AudioConfig,
@@ -48,10 +65,11 @@ from livekit.agents import (
     cli,
     function_tool,
     get_job_context,
+    inference,
     room_io,
 )
 from livekit.agents.llm import Toolset
-from livekit.plugins import xai as xai_plugin
+from livekit.plugins import silero
 
 # ---------------------------------------------------------------------------
 # .env loading — robust against arbitrary cwd
@@ -73,12 +91,67 @@ RAILWAY_SERVER_URL = os.getenv(
     "RAILWAY_SERVER_URL", "https://virtual-transfer-agent-production.up.railway.app"
 )
 
-GROK_VOICE = os.getenv("GROK_VOICE", "Ara")
-GROK_REALTIME_MODEL = os.getenv("GROK_REALTIME_MODEL", "")
-GROK_TEMPERATURE = float(os.getenv("GROK_TEMPERATURE", "0.7"))
+# ---------------------------------------------------------------------------
+# Cascaded pipeline configuration (STT → LLM → TTS). Defaults are the
+# production stack; every stage is swappable via env for A/B testing.
+# ---------------------------------------------------------------------------
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None or not v.strip():
+        return default
+    return v.strip().lower() in {"1", "true", "yes", "on"}
 
+
+def _env_float(name: str, default: float | None) -> float | None:
+    v = os.getenv(name, "")
+    return float(v) if v.strip() else default
+
+
+# -- Backends: "inference" (LiveKit Inference) or "plugin" (own provider key) --
+STT_BACKEND = os.getenv("STT_BACKEND", "inference").strip().lower()
+LLM_BACKEND = os.getenv("LLM_BACKEND", "inference").strip().lower()
+TTS_BACKEND = os.getenv("TTS_BACKEND", "inference").strip().lower()
+
+# -- STT: Deepgram Flux primary; AssemblyAI Universal Streaming A/B -----------
+STT_PROVIDER = os.getenv("STT_PROVIDER", "deepgram_flux").strip().lower()
+STT_LANGUAGE = os.getenv("STT_LANGUAGE", "en")
+STT_MODEL = os.getenv("STT_MODEL", "")  # overrides the provider default if set
+STT_EAGER_EOT_THRESHOLD = _env_float("STT_EAGER_EOT_THRESHOLD", 0.4)  # Flux only
+STT_EOT_THRESHOLD = _env_float("STT_EOT_THRESHOLD", None)             # Flux only
+
+# -- LLM: OpenAI GPT-5.1 Chat on the critical path ---------------------------
+# Default is the NON-reasoning gpt-5.1-chat-latest: GPT-5.1-level quality without
+# the reasoning latency (~1.3s vs ~2.2s TTFT measured). build_llm() stays
+# reasoning-aware — set LLM_MODEL=openai/gpt-5.1 (reasoning) and it sends
+# reasoning_effort instead of temperature; openai/gpt-4.1-mini is the fastest
+# (~0.9s TTFT) if you need to chase the ~870ms first-audio budget.
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-5.1-chat-latest")  # inference id
+LLM_PLUGIN_MODEL = os.getenv("LLM_PLUGIN_MODEL", "gpt-5.1-chat-latest")
+LLM_TEMPERATURE = _env_float("LLM_TEMPERATURE", 0.4)  # non-reasoning models
+LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "low").strip().lower()
+
+# -- TTS: Cartesia Sonic 3.5 -------------------------------------------------
+TTS_MODEL = os.getenv("TTS_MODEL", "cartesia/sonic-3.5")  # inference model id
+TTS_PLUGIN_MODEL = os.getenv("TTS_PLUGIN_MODEL", "sonic-3")
+TTS_VOICE = os.getenv("TTS_VOICE", "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc")
+TTS_LANGUAGE = os.getenv("TTS_LANGUAGE", "en")
+
+# -- Turn detection / interruption / preemptive generation -------------------
+# "stt" uses Deepgram Flux's integrated end-of-turn model (acoustic + semantic).
+# "model" uses LiveKit's audio TurnDetector; "vad" uses VAD-only.
+TURN_DETECTION = os.getenv("TURN_DETECTION", "stt").strip().lower()
+INTERRUPTION_MODE = os.getenv("INTERRUPTION_MODE", "adaptive").strip().lower()
+INTERRUPTION_MIN_DURATION = _env_float("INTERRUPTION_MIN_DURATION", 0.5)
+INTERRUPTION_MIN_WORDS = int(os.getenv("INTERRUPTION_MIN_WORDS", "0") or "0")
+ENDPOINTING_MODE = os.getenv("ENDPOINTING_MODE", "fixed").strip().lower()
 MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.4"))
 MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "3.0"))
+PREEMPTIVE_GENERATION = _env_bool("PREEMPTIVE_GENERATION", True)
+
+# -- Telephony input cleanup: Krisp BVC for SIP audio (optional) -------------
+# "bvc_telephony" (default), "bvc", or "off". Degrades gracefully if the plugin
+# is unavailable (e.g. not deployed to LiveKit Cloud).
+NOISE_CANCELLATION = os.getenv("NOISE_CANCELLATION", "bvc_telephony").strip().lower()
 
 USER_AWAY_TIMEOUT = float(os.getenv("USER_AWAY_TIMEOUT", "10"))
 SILENCE_TOTAL_SECONDS = float(os.getenv("SILENCE_TOTAL_SECONDS", "60"))
@@ -473,9 +546,148 @@ class VTAAgent(Agent):
 
 
 # ---------------------------------------------------------------------------
+# Pipeline component factories — each stage swappable via env (A/B providers).
+# ---------------------------------------------------------------------------
+def build_vad(proc: JobProcess | None = None):
+    """Silero VAD — reuse the prewarmed instance from the worker process."""
+    if proc is not None:
+        vad = proc.userdata.get("vad")
+        if vad is not None:
+            return vad
+    return silero.VAD.load()
+
+
+def build_stt():
+    """Speech-to-text. Default: Deepgram Flux (model-integrated turn detection)."""
+    if STT_BACKEND == "plugin":
+        if STT_PROVIDER == "assemblyai":
+            from livekit.plugins import assemblyai
+
+            return assemblyai.STT(model=STT_MODEL or "universal-streaming-english")
+        from livekit.plugins import deepgram
+
+        kw: dict = {"model": STT_MODEL or "flux-general-en"}
+        if STT_EAGER_EOT_THRESHOLD is not None:
+            kw["eager_eot_threshold"] = STT_EAGER_EOT_THRESHOLD
+        if STT_EOT_THRESHOLD is not None:
+            kw["eot_threshold"] = STT_EOT_THRESHOLD
+        return deepgram.STTv2(**kw)
+
+    # LiveKit Inference (default): co-located, single key, aligned transcripts.
+    if STT_PROVIDER == "assemblyai":
+        return inference.STT(
+            model=STT_MODEL or "assemblyai/universal-streaming-english",
+            language=STT_LANGUAGE,
+        )
+    extra: dict = {}
+    if STT_EAGER_EOT_THRESHOLD is not None:
+        extra["eager_eot_threshold"] = STT_EAGER_EOT_THRESHOLD
+    if STT_EOT_THRESHOLD is not None:
+        extra["eot_threshold"] = STT_EOT_THRESHOLD
+    kw = {"model": STT_MODEL or "deepgram/flux-general", "language": STT_LANGUAGE}
+    if extra:
+        kw["extra_kwargs"] = extra
+    return inference.STT(**kw)
+
+
+def _is_reasoning_model(model: str) -> bool:
+    """OpenAI reasoning models (gpt-5*, o1/o3/o4) take `reasoning_effort` and
+    reject `temperature`. The *-chat-latest variants are non-reasoning."""
+    m = model.lower().rsplit("/", 1)[-1]
+    if "chat" in m:
+        return False
+    return m.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
+def build_llm():
+    """LLM on the critical path. Default: OpenAI GPT-5.1 (reasoning model).
+
+    Reasoning models take `reasoning_effort` (default "low" for voice latency)
+    instead of `temperature`; non-reasoning models take `temperature`. Prompt
+    caching is automatic on the OpenAI backend for the repeated static prefix —
+    see the livekit_llm_prompt_cached_tokens_total metric to verify hit rate.
+    """
+    model = LLM_PLUGIN_MODEL if LLM_BACKEND == "plugin" else LLM_MODEL
+    params: dict = {}
+    if _is_reasoning_model(model):
+        if LLM_REASONING_EFFORT:
+            params["reasoning_effort"] = LLM_REASONING_EFFORT
+    elif LLM_TEMPERATURE is not None:
+        params["temperature"] = LLM_TEMPERATURE
+
+    if LLM_BACKEND == "plugin":
+        from livekit.plugins import openai
+
+        return openai.LLM(model=model, **params)
+
+    kw = {"model": model}
+    if params:
+        kw["extra_kwargs"] = params
+    return inference.LLM(**kw)
+
+
+def build_tts():
+    """Text-to-speech. Default: Cartesia Sonic 3.5 (fast first-byte streaming)."""
+    if TTS_BACKEND == "plugin":
+        from livekit.plugins import cartesia
+
+        return cartesia.TTS(model=TTS_PLUGIN_MODEL, voice=TTS_VOICE, language=TTS_LANGUAGE)
+    return inference.TTS(model=TTS_MODEL, voice=TTS_VOICE, language=TTS_LANGUAGE)
+
+
+def resolve_turn_detection():
+    """Map TURN_DETECTION to a turn-detection mode for TurnHandlingOptions.
+
+    Default "stt" relies on the STT provider's own end-of-turn model (Deepgram
+    Flux / AssemblyAI Universal Streaming). "model" uses LiveKit's audio turn
+    detector — exposed as inference.TurnDetector() on newer SDKs, or the
+    livekit-plugins-turn-detector model plugin on 1.5.x.
+    """
+    if TURN_DETECTION == "model":
+        if hasattr(inference, "TurnDetector"):
+            return inference.TurnDetector()
+        try:
+            if STT_LANGUAGE.lower().startswith("en"):
+                from livekit.plugins.turn_detector.english import EnglishModel
+
+                return EnglishModel()
+            from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+            return MultilingualModel()
+        except Exception as e:
+            logger.warning(f"turn detector model unavailable, falling back to 'stt': {e}")
+            return "stt"
+    if TURN_DETECTION in ("stt", "vad", "manual", "realtime_llm"):
+        return TURN_DETECTION
+    # auto: prefer the STT's integrated endpointing when the provider has one
+    return "stt"
+
+
+def build_noise_cancellation():
+    """Krisp background voice cancellation for SIP input (optional, guarded)."""
+    if NOISE_CANCELLATION in ("", "off", "none", "false"):
+        return None
+    try:
+        from livekit.plugins import noise_cancellation
+
+        if NOISE_CANCELLATION in ("bvc_telephony", "telephony", "bvctelephony"):
+            return noise_cancellation.BVCTelephony()
+        return noise_cancellation.BVC()
+    except Exception as e:
+        logger.warning(f"noise cancellation unavailable ({NOISE_CANCELLATION}): {e}")
+        return None
+
+
+def prewarm(proc: JobProcess) -> None:
+    """Load Silero VAD once per worker process — reused across all jobs."""
+    proc.userdata["vad"] = silero.VAD.load()
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 server = AgentServer()
+server.setup_fnc = prewarm
 
 # Start metrics exposition once at process boot (scrape server and/or
 # Grafana Cloud remote-write, per METRICS_MODE). Idempotent + non-fatal.
@@ -511,17 +723,13 @@ async def entrypoint(ctx: JobContext):
                 pass
 
         # ------------------------------------------------------------------
-        # 2. PARALLEL: Build Grok model + fetch full_name from Railway
-        #    Both happen while we wait for SIP participant.
+        # 2. PARALLEL: build pipeline components + fetch full_name from Railway
+        #    Both happen while we wait for the SIP participant.
         # ------------------------------------------------------------------
-        model_kwargs: dict = {"voice": GROK_VOICE}
-        if GROK_REALTIME_MODEL:
-            model_kwargs["model"] = GROK_REALTIME_MODEL
-        try:
-            model_kwargs["temperature"] = GROK_TEMPERATURE
-            rt_model = xai_plugin.realtime.RealtimeModel(**model_kwargs)
-        except TypeError:
-            rt_model = xai_plugin.realtime.RealtimeModel(voice=GROK_VOICE)
+        vad = build_vad(getattr(ctx, "proc", None))
+        stt = build_stt()
+        llm = build_llm()
+        tts = build_tts()
 
         name_task = asyncio.create_task(fetch_full_name(phone, http_session)) if phone else None
 
@@ -604,21 +812,38 @@ async def entrypoint(ctx: JobContext):
         # Session
         # ------------------------------------------------------------------
         session = AgentSession(
-            llm=rt_model,
+            vad=vad,
+            stt=stt,
+            llm=llm,
+            tts=tts,
             turn_handling=TurnHandlingOptions(
+                turn_detection=resolve_turn_detection(),
                 endpointing={
-                    "mode": "fixed",
+                    "mode": ENDPOINTING_MODE,
                     "min_delay": MIN_ENDPOINTING_DELAY,
                     "max_delay": MAX_ENDPOINTING_DELAY,
                 },
+                interruption={
+                    "mode": INTERRUPTION_MODE,
+                    "min_duration": INTERRUPTION_MIN_DURATION,
+                    "min_words": INTERRUPTION_MIN_WORDS,
+                },
             ),
+            # Start LLM generation before the user's end-of-turn is confirmed.
+            preemptive_generation=PREEMPTIVE_GENERATION,
             user_away_timeout=USER_AWAY_TIMEOUT,
         )
 
-        room_opts = room_io.RoomOptions(audio_input=room_io.AudioInputOptions())
+        nc = build_noise_cancellation()
+        audio_in = (
+            room_io.AudioInputOptions(noise_cancellation=nc)
+            if nc is not None
+            else room_io.AudioInputOptions()
+        )
+        room_opts = room_io.RoomOptions(audio_input=audio_in)
         if linked_identity:
             room_opts = room_io.RoomOptions(
-                audio_input=room_io.AudioInputOptions(),
+                audio_input=audio_in,
                 participant_identity=linked_identity,
             )
 
@@ -627,7 +852,11 @@ async def entrypoint(ctx: JobContext):
         # Attach Prometheus instrumentation to this call (latency, tokens,
         # disposition, active-session gauge, shutdown finalizer).
         observability.instrument_session(
-            session, ctx, model=(GROK_REALTIME_MODEL or "grok-realtime")
+            session,
+            ctx,
+            model=LLM_MODEL,
+            stt_model=(STT_MODEL or STT_PROVIDER),
+            tts_model=TTS_MODEL,
         )
 
         # Update SIP identity after session links
@@ -816,9 +1045,8 @@ async def entrypoint(ctx: JobContext):
                 return
             logger.info("[NUDGE] prompting model to call log_verification")
             try:
-                # tool_choice MUST be a string for xAI Realtime
-                # (per_response_tool_choice=False). "required" forces a tool
-                # call; since log_verification is our only tool, that's it.
+                # tool_choice="required" forces a tool call; since
+                # log_verification is our only tool, the model must call it.
                 handle = session.generate_reply(
                     instructions=(
                         "You just finished speaking. If that was a "
@@ -1009,8 +1237,10 @@ async def entrypoint(ctx: JobContext):
 
         logger.info(
             f"VTA started: {phone} ({full_name}) | "
-            f"voice={GROK_VOICE} silence={USER_AWAY_TIMEOUT}s/{SILENCE_TOTAL_SECONDS}s "
-            f"max={MAX_CALL_DURATION}s"
+            f"stt={STT_MODEL or STT_PROVIDER} llm={LLM_MODEL} tts={TTS_MODEL} "
+            f"turn={TURN_DETECTION} interrupt={INTERRUPTION_MODE} "
+            f"preempt={PREEMPTIVE_GENERATION} | "
+            f"silence={USER_AWAY_TIMEOUT}s/{SILENCE_TOTAL_SECONDS}s max={MAX_CALL_DURATION}s"
         )
 
     except Exception:

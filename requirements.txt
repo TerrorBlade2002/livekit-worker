@@ -1,13 +1,20 @@
-# Core LiveKit Agents — `~=1.4` allows any 1.x >= 1.4 (including 1.5.x).
-# The [xai] extra brings in livekit-plugins-xai automatically, which provides
-# xai.realtime.RealtimeModel for the Grok Realtime voice agent.
-livekit-agents[xai]~=1.4
+# Core LiveKit Agents — needs >=1.5 for Adaptive Interruption Handling,
+# LiveKit Inference (STT/LLM/TTS), inference.TurnDetector, and the cascaded
+# TurnHandlingOptions (preemptive generation, interruption modes).
+#
+# The default pipeline runs through LiveKit Inference (no provider keys needed
+# beyond LIVEKIT_*). The extras below pull in the direct provider plugins that
+# back the `*_BACKEND=plugin` escape hatch and the AssemblyAI A/B STT path.
+livekit-agents[deepgram,openai,cartesia,assemblyai,silero,turn-detector]~=1.5
 
-# Silero VAD — required for the cascaded pipeline's turn detection.
-# Loaded once per worker process via prewarm_fnc.
-livekit-plugins-silero~=1.4
+# Silero VAD — loaded once per worker process via the prewarm (server.setup_fnc).
+livekit-plugins-silero~=1.5
 
-# Direct LiveKit API (room/participant management, sip dispatch helpers)
+# Krisp background voice cancellation (BVCTelephony) for SIP/telephony input.
+# Optional: set NOISE_CANCELLATION=off if not deployed to LiveKit Cloud.
+livekit-plugins-noise-cancellation~=1.5
+
+# Direct LiveKit API (room/participant management, SIP dispatch helpers)
 livekit-api>=1.0
 
 python-dotenv>=1.0.0

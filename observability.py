@@ -28,13 +28,19 @@ mode, so dashboards and alerts are portable between local and Grafana Cloud.
 
 WHAT WE MEASURE
 ---------------
-The agent uses a **realtime** model (xAI Grok Realtime), so there is no
-separate STT/TTS to time. The meaningful signals are:
-  * RealtimeModelMetrics  -> TTFT, response duration, tokens, tokens/sec
+The agent runs a **cascaded** pipeline (Deepgram Flux STT -> GPT-4.1 mini LLM
+-> Cartesia Sonic 3.5 TTS), so each stage is timed independently:
+  * LLMMetrics            -> LLM TTFT, response duration, tokens, cached tokens
+  * TTSMetrics            -> TTS time-to-first-byte (first audio chunk latency)
+  * STTMetrics            -> audio duration processed
+  * EOUMetrics            -> end-of-utterance delay + transcription (commit) delay
+  * InterruptionMetrics   -> adaptive barge-in: true interruptions vs backchannels
   * ChatMessage.metrics   -> per-turn end-to-end latency (the headline UX metric)
-  * EOUMetrics            -> end-of-utterance (turn-detection) delay
   * Business dispositions -> verified / dnc / wrong_number / ... (call outcomes)
   * Reliability           -> errors, tool-call outcomes, forced call-ends
+
+RealtimeModelMetrics are still handled (mapped onto the LLM_* series) so that
+swapping back to a realtime model for rollback keeps the dashboards working.
 
 NOTE ON THE DEPRECATED EVENT
 ----------------------------
@@ -163,16 +169,23 @@ E2E_LATENCY = Histogram(
 )
 LLM_TTFT = Histogram(
     "livekit_llm_ttft_seconds",
-    "Realtime model time-to-first-audio-token.",
+    "LLM time-to-first-token (critical-path response latency).",
     ["agent", "model"],
     buckets=_LATENCY_BUCKETS,
     registry=REGISTRY,
 )
 LLM_RESPONSE_DURATION = Histogram(
     "livekit_llm_response_duration_seconds",
-    "Realtime model full-response generation time.",
+    "LLM full-response generation time.",
     ["agent", "model"],
     buckets=_DURATION_BUCKETS,
+    registry=REGISTRY,
+)
+TTS_TTFB = Histogram(
+    "livekit_tts_ttfb_seconds",
+    "TTS time-to-first-byte (first synthesized audio chunk latency).",
+    ["agent", "model"],
+    buckets=_LATENCY_BUCKETS,
     registry=REGISTRY,
 )
 EOU_DELAY = Histogram(
@@ -180,6 +193,19 @@ EOU_DELAY = Histogram(
     "End-of-utterance (turn-detection) delay.",
     ["agent"],
     buckets=_LATENCY_BUCKETS,
+    registry=REGISTRY,
+)
+TRANSCRIPTION_DELAY = Histogram(
+    "livekit_transcription_delay_seconds",
+    "Time to obtain the final transcript after end of user speech (STT commit delay).",
+    ["agent"],
+    buckets=_LATENCY_BUCKETS,
+    registry=REGISTRY,
+)
+STT_AUDIO_SECONDS = Counter(
+    "livekit_stt_audio_seconds_total",
+    "Total audio duration (seconds) processed by STT.",
+    ["agent", "model"],
     registry=REGISTRY,
 )
 
@@ -198,8 +224,22 @@ LLM_OUTPUT_TOKENS = Counter(
 )
 LLM_RESPONSES = Counter(
     "livekit_llm_responses_total",
-    "Number of realtime model responses (one per assistant turn).",
+    "Number of LLM responses (one per assistant turn).",
     ["agent", "model"],
+    registry=REGISTRY,
+)
+LLM_PROMPT_CACHED_TOKENS = Counter(
+    "livekit_llm_prompt_cached_tokens_total",
+    "Prompt tokens served from the provider prompt cache. Compare against "
+    "livekit_llm_input_tokens_total to gauge prompt-caching effectiveness.",
+    ["agent", "model"],
+    registry=REGISTRY,
+)
+INTERRUPTIONS = Counter(
+    "livekit_interruptions_total",
+    "Adaptive interruption model outcomes, labelled by kind "
+    "(interruption = true barge-in, backchannel = filtered acknowledgment).",
+    ["agent", "kind"],
     registry=REGISTRY,
 )
 
@@ -389,22 +429,79 @@ class _SessionObserver:
     lives here (keyed by the session object), never in module globals.
     """
 
-    def __init__(self, session: Any, model: str):
+    def __init__(
+        self, session: Any, model: str, tts_model: str = "", stt_model: str = ""
+    ):
         self.session = session
         self.model = model or "unknown"
+        self.tts_model = tts_model or "unknown"
+        self.stt_model = stt_model or "unknown"
         self.started_at = time.monotonic()
         self.status = "unknown"  # overwritten by note_status() on the end path
         self.finalized = False
+        # InterruptionMetrics counters are cumulative per session; track the
+        # last seen totals so we record monotonic deltas into the counter.
+        self._last_interruptions = 0
+        self._last_backchannels = 0
 
     # -- metrics_collected (deprecated session event; see module docstring) --
     def on_session_metrics(self, ev: Any) -> None:
         try:
             m = getattr(ev, "metrics", ev)
-            name = type(m).__name__
+            # Each metric carries a stable `type` discriminator (e.g.
+            # "llm_metrics"); fall back to the class name if absent.
+            mtype = getattr(m, "type", None) or type(m).__name__
 
-            if name == "RealtimeModelMetrics" or (
-                hasattr(m, "ttft") and hasattr(m, "input_tokens")
-            ):
+            if mtype in ("llm_metrics", "LLMMetrics"):
+                ttft = getattr(m, "ttft", None)
+                if ttft is not None and ttft >= 0:
+                    LLM_TTFT.labels(AGENT_LABEL, self.model).observe(ttft)
+                dur = getattr(m, "duration", None)
+                if dur is not None and dur >= 0:
+                    LLM_RESPONSE_DURATION.labels(AGENT_LABEL, self.model).observe(dur)
+                in_tok = int(getattr(m, "prompt_tokens", 0) or 0)
+                out_tok = int(getattr(m, "completion_tokens", 0) or 0)
+                cached = int(getattr(m, "prompt_cached_tokens", 0) or 0)
+                if in_tok:
+                    LLM_INPUT_TOKENS.labels(AGENT_LABEL, self.model).inc(in_tok)
+                if out_tok:
+                    LLM_OUTPUT_TOKENS.labels(AGENT_LABEL, self.model).inc(out_tok)
+                if cached:
+                    LLM_PROMPT_CACHED_TOKENS.labels(AGENT_LABEL, self.model).inc(cached)
+                LLM_RESPONSES.labels(AGENT_LABEL, self.model).inc()
+
+            elif mtype in ("tts_metrics", "TTSMetrics"):
+                ttfb = getattr(m, "ttfb", None)
+                if ttfb is not None and ttfb >= 0:
+                    TTS_TTFB.labels(AGENT_LABEL, self.tts_model).observe(ttfb)
+
+            elif mtype in ("stt_metrics", "STTMetrics"):
+                ad = getattr(m, "audio_duration", None)
+                if ad is not None and ad >= 0:
+                    STT_AUDIO_SECONDS.labels(AGENT_LABEL, self.stt_model).inc(ad)
+
+            elif mtype in ("eou_metrics", "EOUMetrics"):
+                eou = getattr(m, "end_of_utterance_delay", None)
+                if eou is not None and eou >= 0:
+                    EOU_DELAY.labels(AGENT_LABEL).observe(eou)
+                td = getattr(m, "transcription_delay", None)
+                if td is not None and td >= 0:
+                    TRANSCRIPTION_DELAY.labels(AGENT_LABEL).observe(td)
+
+            elif mtype in ("interruption_metrics", "InterruptionMetrics"):
+                ni = int(getattr(m, "num_interruptions", 0) or 0)
+                nb = int(getattr(m, "num_backchannels", 0) or 0)
+                d_i = max(0, ni - self._last_interruptions)
+                d_b = max(0, nb - self._last_backchannels)
+                if d_i:
+                    INTERRUPTIONS.labels(AGENT_LABEL, "interruption").inc(d_i)
+                if d_b:
+                    INTERRUPTIONS.labels(AGENT_LABEL, "backchannel").inc(d_b)
+                self._last_interruptions = ni
+                self._last_backchannels = nb
+
+            elif mtype in ("realtime_model_metrics", "RealtimeModelMetrics"):
+                # Retained for rollback to a realtime model — map onto LLM_*.
                 ttft = getattr(m, "ttft", None)
                 if ttft is not None and ttft >= 0:  # realtime ttft can be -1
                     LLM_TTFT.labels(AGENT_LABEL, self.model).observe(ttft)
@@ -418,11 +515,6 @@ class _SessionObserver:
                 if out_tok:
                     LLM_OUTPUT_TOKENS.labels(AGENT_LABEL, self.model).inc(out_tok)
                 LLM_RESPONSES.labels(AGENT_LABEL, self.model).inc()
-
-            elif name == "EOUMetrics" or hasattr(m, "end_of_utterance_delay"):
-                eou = getattr(m, "end_of_utterance_delay", None)
-                if eou is not None and eou >= 0:
-                    EOU_DELAY.labels(AGENT_LABEL).observe(eou)
         except Exception as e:  # never break the call on a telemetry bug
             logger.debug("on_session_metrics error: %s", e)
 
@@ -463,7 +555,13 @@ class _SessionObserver:
         flush()  # best-effort tail push for the scale-to-zero case
 
 
-def instrument_session(session: Any, ctx: Any, model: str = "") -> _SessionObserver:
+def instrument_session(
+    session: Any,
+    ctx: Any,
+    model: str = "",
+    tts_model: str = "",
+    stt_model: str = "",
+) -> _SessionObserver:
     """Attach Prometheus instrumentation to one AgentSession.
 
     Call this right after `await session.start(...)` in the entrypoint. It:
@@ -472,10 +570,12 @@ def instrument_session(session: Any, ctx: Any, model: str = "") -> _SessionObser
       * increments started/active counters, and
       * registers a shutdown callback to finalize duration + disposition.
 
+    `model`/`tts_model`/`stt_model` label the per-stage metrics (LLM/TTS/STT).
+
     Returns the observer (also stored as `session._vta_obs`).
     """
     init_exposition()
-    obs = _SessionObserver(session, model)
+    obs = _SessionObserver(session, model, tts_model, stt_model)
     try:
         session._vta_obs = obs  # type: ignore[attr-defined]
     except Exception:
