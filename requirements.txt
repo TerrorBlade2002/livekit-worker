@@ -12,7 +12,8 @@ livekit-plugins-silero~=1.5
 
 # Krisp background voice cancellation (BVCTelephony) for SIP/telephony input.
 # Optional: set NOISE_CANCELLATION=off if not deployed to LiveKit Cloud.
-livekit-plugins-noise-cancellation~=1.5
+# NOTE: this plugin is on its own 0.2.x version line (not 1.x).
+livekit-plugins-noise-cancellation>=0.2
 
 # Direct LiveKit API (room/participant management, SIP dispatch helpers)
 livekit-api>=1.0
