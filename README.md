@@ -194,5 +194,14 @@ Grafana Cloud (`METRICS_MODE=remote_write`); locally it exposes `/metrics`
 [`../monitoring/README.md`](../monitoring/README.md). Configure via the
 `METRICS_*` vars in [.env.example](.env.example).
 
+### Transcripts → Loki
+
+At the end of every call (agent hangup **or** customer drop), the agent ships
+the full transcript + a call-summary analytics record to Loki via
+[`transcripts.py`](transcripts.py) — available immediately, not on LiveKit's
+delayed publish. No-op until `LOKI_PUSH_URL` is set. Setup, LogQL queries, and
+Grafana Cloud Loki config: [`../monitoring/README.md` §7](../monitoring/README.md#7-transcripts--loki).
+Configure via the `LOKI_*` vars in [.env.example](.env.example).
+
 ## Important
 The existing webhook repo should continue to own only the Node webhook server in [retell-vta-webhook/retell-vta-webhook](../retell-vta-webhook/retell-vta-webhook).

@@ -83,6 +83,8 @@ logger.setLevel(logging.INFO)
 # Prometheus observability. Imported AFTER load_dotenv() above so the module
 # reads METRICS_* env vars at import time.
 import observability  # noqa: E402
+# Transcript + call-summary capture to Loki (reads LOKI_* env at import time).
+import transcripts  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -894,6 +896,19 @@ async def entrypoint(ctx: JobContext):
             model=LLM_MODEL,
             stt_model=(STT_MODEL or STT_PROVIDER),
             tts_model=TTS_MODEL,
+        )
+
+        # Capture the full transcript + call-summary analytics and push them to
+        # Loki when the call ends (agent hangup OR customer drop) — available
+        # immediately, instead of waiting on LiveKit Cloud's delayed publish.
+        # get_meta reads the latest phone/full_name (they can change on late SIP
+        # join); the final disposition is read from the observability observer.
+        transcripts.instrument_transcripts(
+            session,
+            ctx,
+            call_id=ctx.room.name or "",
+            get_meta=lambda: {"phone": phone, "full_name": full_name},
+            models={"llm": LLM_MODEL, "stt": STT_MODEL or STT_PROVIDER, "tts": TTS_MODEL},
         )
 
         # Update SIP identity after session links
